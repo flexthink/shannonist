@@ -1,0 +1,1 @@
+Docstrings should use numpy style

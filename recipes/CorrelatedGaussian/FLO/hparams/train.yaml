@@ -1,0 +1,61 @@
+seed: 1337
+
+# Synthetic data
+mutual_information: 2.0
+dim: 20
+train_samples: 32768
+valid_samples: 8192
+
+# Training
+number_of_epochs: 20
+batch_size: 256
+lr: 0.0001
+
+# Model
+feature_dim: 64
+encoder_hidden_dims: [128, 128]
+potential_hidden_dims: [128]
+
+train_set: !new:shannonist.mi.CorrelatedGausian
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_samples: !ref <train_samples>
+
+valid_set: !new:shannonist.mi.CorrelatedGausian
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_samples: !ref <valid_samples>
+
+encoder_x: !new:shannonist.models.MLP
+    input_dim: !ref <dim>
+    output_dim: !ref <feature_dim>
+    hidden_dim: !ref <encoder_hidden_dims>
+
+encoder_y: !new:shannonist.models.MLP
+    input_dim: !ref <dim>
+    output_dim: !ref <feature_dim>
+    hidden_dim: !ref <encoder_hidden_dims>
+
+potential: !new:shannonist.models.BilinearPotential
+    input_dim: !ref <feature_dim>
+    hidden_dim: !ref <potential_hidden_dims>
+
+estimator: !new:shannonist.mi.BilinearFLO
+    encoder_x: !ref <encoder_x>
+    encoder_y: !ref <encoder_y>
+    potential: !ref <potential>
+    tau: 1.0
+    use_norm: True
+
+optimizer: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+train_loader_kwargs:
+    batch_size: !ref <batch_size>
+    shuffle: True
+    num_workers: 0
+
+valid_loader_kwargs:
+    batch_size: !ref <batch_size>
+    shuffle: False
+    num_workers: 0
