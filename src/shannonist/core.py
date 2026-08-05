@@ -299,6 +299,8 @@ def _move_to_device(value: Any, device: torch.device) -> Any:
     """Recursively move tensors in a batch to a device."""
     if isinstance(value, Tensor):
         return value.to(device)
+    if hasattr(value, "to"):
+        return value.to(device)
     if isinstance(value, Mapping):
         return type(value)(
             (key, _move_to_device(item, device)) for key, item in value.items()
@@ -307,8 +309,6 @@ def _move_to_device(value: Any, device: torch.device) -> Any:
         return tuple(_move_to_device(item, device) for item in value)
     if isinstance(value, list):
         return [_move_to_device(item, device) for item in value]
-    if hasattr(value, "to"):
-        return value.to(device)
     return value
 
 

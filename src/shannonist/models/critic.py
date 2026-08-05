@@ -6,7 +6,7 @@ from torch import Tensor
 from torch import nn
 from torch.nn import functional as F
 
-from shannonist.models.mlp import MLP
+from shannonist.models.mlp import MLP, MultiMLP
 
 
 class BilinearPotential(nn.Module):
@@ -60,6 +60,137 @@ class BilinearPotential(nn.Module):
             Potential values with shape ``(batch, output_dim)``.
         """
         return self.mlp(torch.cat((x, y), dim=1))
+
+
+class PairwiseCritic(nn.Module):
+    r"""Compute symmetric pairwise interactions between encoded inputs.
+
+    A :class:`MultiMLP` independently encodes every position in the count
+    dimension. Pairwise scores are then computed as
+
+    .. math::
+
+        s_{ij} = h_i^\mathsf{T} W h_j, \qquad W = A^\mathsf{T} A.
+
+    The factorization makes ``W`` symmetric and positive semidefinite, so
+    swapping ``i`` and ``j`` does not change the interaction score.
+
+    Parameters
+    ----------
+    encoder : MultiMLP
+        Parallel encoder mapping ``(*, count, input_features)`` to
+        ``(*, count, feature_dim)``.
+    count : int
+        Size expected in the input's penultimate dimension.
+    use_norm : bool, default=True
+        Whether to L2-normalize encoded representations along their feature
+        dimension.
+
+    Attributes
+    ----------
+    A : nn.Parameter
+        Learned matrix whose Gram matrix defines the symmetric interaction.
+    """
+
+    def __init__(
+        self,
+        encoder: MultiMLP,
+        count: int,
+        use_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        if count <= 0:
+            raise ValueError("count must be positive")
+        if encoder.count != count:
+            raise ValueError(
+                f"encoder count {encoder.count} does not match critic count {count}"
+            )
+
+        self.encoder = encoder
+        self.count = count
+        self.feature_dim = encoder.output_dim
+        self.use_norm = use_norm
+        self.A = nn.Parameter(torch.empty(self.feature_dim, self.feature_dim))
+        nn.init.xavier_uniform_(self.A)
+
+    @property
+    def weight(self) -> Tensor:
+        """Return the symmetric positive-semidefinite interaction matrix."""
+        return self.A.transpose(0, 1) @ self.A
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Compute every pairwise interaction score.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input with shape ``(*, count, input_features)``.
+
+        Returns
+        -------
+        Tensor
+            Symmetric interaction matrix with shape ``(*, count, count)``.
+
+        Raises
+        ------
+        ValueError
+            If the input or encoded representation has an incompatible shape.
+        """
+        hx = self.encode(x)
+        return self.compute_interactions(hx)
+
+    def encode(self, x: Tensor) -> Tensor:
+        """Encode and optionally normalize all count positions.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input with shape ``(*, count, input_features)``.
+
+        Returns
+        -------
+        Tensor
+            Encoded input with shape ``(*, count, feature_dim)``.
+        """
+        if x.ndim < 2:
+            raise ValueError("input must have shape (*, count, features)")
+        if x.shape[-2] != self.count:
+            raise ValueError(
+                f"expected count dimension {self.count}, got {x.shape[-2]}"
+            )
+
+        hx = self.encoder(x)
+        if hx.shape[-2] != self.count or hx.shape[-1] != self.feature_dim:
+            raise ValueError(
+                "encoder must return shape (*, count, encoder.output_dim)"
+            )
+        if self.use_norm:
+            hx = F.normalize(hx, dim=-1)
+        return hx
+
+    def compute_interactions(self, hx: Tensor) -> Tensor:
+        """Compute symmetric interactions from encoded representations.
+
+        Parameters
+        ----------
+        hx : Tensor
+            Encoded representations with shape
+            ``(*, count, feature_dim)``.
+
+        Returns
+        -------
+        Tensor
+            Symmetric interaction matrix with shape ``(*, count, count)``.
+        """
+        if hx.ndim < 2:
+            raise ValueError("encoded input must have shape (*, count, feature_dim)")
+        if hx.shape[-2:] != (self.count, self.feature_dim):
+            raise ValueError(
+                "encoded input must have shape (*, count, feature_dim)"
+            )
+
+        interaction = (hx @ self.weight) @ hx.transpose(-2, -1)
+        return (interaction + interaction.transpose(-2, -1)) / 2
 
 
 class BilinearCriticOutput(TensorClass):

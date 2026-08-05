@@ -44,4 +44,16 @@ class MIEstimate(TensorClass):
     details: TensorDict | None = None
 
 
-__all__ = ["MIBatch", "MIEstimate"]
+class PairwiseMIBatch(TensorClass):
+    """Observations used to estimate pairwise mutual information.
+
+    Parameters
+    ----------
+    x : Tensor
+        Observations with shape ``(batch, count, features)``.
+    """
+
+    x: Tensor
+
+
+__all__ = ["MIBatch", "MIEstimate", "PairwiseMIBatch"]

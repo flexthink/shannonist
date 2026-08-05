@@ -89,19 +89,24 @@ shape `(batch, features)`.
 ## Synthetic correlated Gaussian data
 
 `CorrelatedGausian` is a lazy synthetic dataset with a known mutual information
-in nats:
+in nats. Individual samples and collated batches are TensorDicts:
 
 ```python
 from torch.utils.data import DataLoader
 
-from shannonist.mi import CorrelatedGausian
+from shannonist.mi import CorrelatedGausian, tensordict_collate
 
 dataset = CorrelatedGausian(
     mutual_information=2.0,
     dim=20,
     num_samples=10_000,
 )
-loader = DataLoader(dataset, batch_size=256, shuffle=True)
+loader = DataLoader(
+    dataset,
+    batch_size=256,
+    shuffle=True,
+    collate_fn=tensordict_collate,
+)
 
 batch = next(iter(loader))
 print(batch["x"].shape)  # torch.Size([256, 20])
@@ -118,6 +123,36 @@ rho = sqrt(1 - exp(-2 I* / d))
 ```
 
 where `epsilon` is an independent standard Gaussian.
+
+For experiments involving more than two variables, provide a symmetric
+pairwise-MI matrix to `PairwiseCorrelatedGaussian`:
+
+```python
+import torch
+
+from shannonist.mi import PairwiseCorrelatedGaussian
+
+pairwise_mi = torch.tensor(
+    [
+        [0.0, 0.2, 0.1],
+        [0.2, 0.0, 0.15],
+        [0.1, 0.15, 0.0],
+    ]
+)
+dataset = PairwiseCorrelatedGaussian(
+    mutual_information=pairwise_mi,
+    dim=20,
+    num_samples=10_000,
+)
+
+sample = dataset[0]
+print(sample["x"].shape)  # torch.Size([3, 20])
+```
+
+The dataset converts each MI value to an isotropic Gaussian correlation and
+generates all variables from independent latent Gaussians. The resulting
+correlation matrix must be positive semidefinite; inconsistent MI matrices are
+rejected with `ValueError`.
 
 ## Run the included recipe
 
@@ -142,6 +177,28 @@ python recipes/CorrelatedGaussian/FLO/train.py \
 
 VS Code users can launch the same recipe with the included
 `FLO: Correlated Gaussian` debug configuration.
+
+The pairwise recipe trains `PairwiseFLO` from a user-supplied MI matrix and
+prints its learned lower bounds beside the ground truth:
+
+```bash
+python recipes/PairwiseCorrelatedGaussian/FLO/train.py \
+  recipes/PairwiseCorrelatedGaussian/FLO/hparams/train.yaml
+```
+
+See the recipe's README for matrix override examples and validity constraints.
+
+## Development and tests
+
+Install the test dependencies and run the unit suite with:
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest
+```
+
+Pytest only collects the library tests under `tests/`; runnable recipe scripts
+are intentionally excluded.
 
 ## The estimator interface
 

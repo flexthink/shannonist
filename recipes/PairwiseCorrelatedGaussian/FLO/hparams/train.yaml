@@ -1,7 +1,12 @@
 seed: 1337
 
-# Synthetic data
-mutual_information: 2.0
+# Synthetic data. The matrix must be symmetric, have a zero diagonal, and
+# produce a positive-semidefinite Gaussian correlation matrix.
+mutual_information:
+    - [0.0, 0.20, 0.10]
+    - [0.20, 0.0, 0.15]
+    - [0.10, 0.15, 0.0]
+count: 3
 dim: 20
 train_samples: 32768
 valid_samples: 8192
@@ -14,36 +19,26 @@ lr: 0.0001
 # Model
 feature_dim: 64
 encoder_hidden_dims: [128, 128]
-potential_hidden_dims: [128]
 
-train_set: !new:shannonist.mi.CorrelatedGausian
+train_set: !new:shannonist.mi.PairwiseCorrelatedGaussian
     mutual_information: !ref <mutual_information>
     dim: !ref <dim>
     num_samples: !ref <train_samples>
 
-valid_set: !new:shannonist.mi.CorrelatedGausian
+valid_set: !new:shannonist.mi.PairwiseCorrelatedGaussian
     mutual_information: !ref <mutual_information>
     dim: !ref <dim>
     num_samples: !ref <valid_samples>
 
-encoder_x: !new:shannonist.models.MLP
+encoder: !new:shannonist.models.MultiMLP
     input_dim: !ref <dim>
+    count: !ref <count>
     output_dim: !ref <feature_dim>
     hidden_dim: !ref <encoder_hidden_dims>
 
-encoder_y: !new:shannonist.models.MLP
-    input_dim: !ref <dim>
-    output_dim: !ref <feature_dim>
-    hidden_dim: !ref <encoder_hidden_dims>
-
-potential: !new:shannonist.models.BilinearPotential
-    input_dim: !ref <feature_dim>
-    hidden_dim: !ref <potential_hidden_dims>
-
-estimator: !new:shannonist.mi.BilinearFLO
-    encoder_x: !ref <encoder_x>
-    encoder_y: !ref <encoder_y>
-    potential: !ref <potential>
+estimator: !new:shannonist.mi.PairwiseFLO
+    encoder: !ref <encoder>
+    count: !ref <count>
     tau: 1.0
     use_norm: True
 

@@ -3,8 +3,13 @@ from tensordict import TensorClass, TensorDict
 from torch import Tensor, nn
 
 from shannonist.framework import ObjectiveOutput, TrainableEstimator
-from shannonist.mi.types import MIBatch, MIEstimate
-from shannonist.models.critic import BilinearCritic, BilinearCriticOutput
+from shannonist.mi.types import MIBatch, MIEstimate, PairwiseMIBatch
+from shannonist.models.critic import (
+    BilinearCritic,
+    BilinearCriticOutput,
+    PairwiseCritic,
+)
+from shannonist.models.mlp import MultiMLP
 
 
 class BilinearFLOOutput(TensorClass):
@@ -19,7 +24,7 @@ class BilinearFLOOutput(TensorClass):
     critic: BilinearCriticOutput
 
 
-def LossFLO(predictions: BilinearFLOOutput) -> tuple[Tensor, TensorDict]:
+def flo_loss(predictions: BilinearFLOOutput) -> tuple[Tensor, TensorDict]:
     """Compute the contrastive Fenchel-Legendre optimization loss.
 
     Positive pairs occupy matching positions in the two critic
@@ -165,7 +170,7 @@ class BilinearFLO(
         ObjectiveOutput
             Scalar FLO loss and diagnostic tensors.
         """
-        loss, details = LossFLO(predictions)
+        loss, details = flo_loss(predictions)
         return ObjectiveOutput(loss=loss, metrics=details, batch_size=[])
 
     def MI(self, predictions: BilinearFLOOutput) -> tuple[Tensor, TensorDict]:
@@ -210,4 +215,218 @@ class BilinearFLO(
             raise NotImplementedError("BilinearFLO does not yet support masks")
 
 
-__all__ = ["BilinearFLO", "BilinearFLOOutput", "LossFLO"]
+class PairwiseFLOOutput(TensorClass):
+    """Predictions and auxiliary outputs produced by pairwise FLO.
+
+    Parameters
+    ----------
+    hx : Tensor
+        Temperature-scaled representations with shape
+        ``(*, count, feature_dim)``.
+    u : Tensor
+        Symmetric FLO potentials with shape ``(*, count, count)``.
+    """
+
+    hx: Tensor
+    u: Tensor
+
+
+def pairwise_flo_loss(
+    predictions: PairwiseFLOOutput,
+) -> tuple[Tensor, TensorDict]:
+    """Compute jointly optimized FLO losses for all distinct pairs.
+
+    All leading dimensions are flattened into the sample dimension. FLO is
+    evaluated independently for every ordered pair, the two directions are
+    averaged to enforce symmetry, and the scalar training loss is the mean
+    over unique off-diagonal pairs.
+
+    Parameters
+    ----------
+    predictions : PairwiseFLOOutput
+        Precomputed representations and symmetric potential values.
+
+    Returns
+    -------
+    tuple[Tensor, TensorDict]
+        Mean loss over unique pairs and diagnostic tensors. The
+        ``loss_matrix`` diagnostic has shape ``(count, count)`` and a zero
+        diagonal.
+
+    Raises
+    ------
+    ValueError
+        If prediction shapes are incompatible or fewer than two samples are
+        available.
+    """
+    hx = predictions.hx
+    u = predictions.u
+    if hx.ndim < 3:
+        raise ValueError("hx must have shape (*, count, feature_dim)")
+    if u.shape != (*hx.shape[:-1], hx.shape[-2]):
+        raise ValueError("u must have shape (*, count, count)")
+
+    count = hx.shape[-2]
+    feature_dim = hx.shape[-1]
+    hx = hx.reshape(-1, count, feature_dim)
+    u = u.reshape(-1, count, count)
+    sample_count = hx.shape[0]
+    if sample_count < 2:
+        raise ValueError("pairwise FLO requires at least two samples")
+
+    similarity = torch.einsum("nif,mjf->ijnm", hx, hx)
+    positive_mask = torch.eye(
+        sample_count,
+        dtype=torch.bool,
+        device=similarity.device,
+    )
+    g = similarity[..., positive_mask].reshape(count, count, sample_count)
+    g0 = similarity[..., ~positive_mask].reshape(
+        count,
+        count,
+        sample_count,
+        sample_count - 1,
+    )
+    g0_logsumexp = torch.logsumexp(g0, dim=-1)
+    u_by_pair = u.permute(1, 2, 0)
+    loss_vec = (
+        u_by_pair
+        + torch.exp(-u_by_pair + g0_logsumexp - g) / (sample_count - 1)
+        - 1
+    )
+    loss_matrix = loss_vec.mean(dim=-1)
+    loss_matrix = (loss_matrix + loss_matrix.transpose(0, 1)) / 2
+    off_diagonal = ~torch.eye(count, dtype=torch.bool, device=loss_matrix.device)
+    loss_matrix = loss_matrix.masked_fill(~off_diagonal, 0)
+    loss = loss_matrix[torch.triu(off_diagonal, diagonal=1)].mean()
+
+    symmetric_loss_vec = (loss_vec + loss_vec.transpose(0, 1)) / 2
+    symmetric_loss_vec = symmetric_loss_vec.permute(2, 0, 1)
+    symmetric_loss_vec = symmetric_loss_vec.masked_fill(
+        ~off_diagonal.unsqueeze(0),
+        0,
+    )
+    details = TensorDict(
+        {
+            "loss_vec": symmetric_loss_vec,
+            "loss_matrix": loss_matrix,
+            "similarity": similarity,
+            "u": u,
+        },
+        batch_size=[],
+    )
+    return loss, details
+
+
+class PairwiseFLO(
+    nn.Module,
+    TrainableEstimator[PairwiseMIBatch, PairwiseFLOOutput, MIEstimate],
+):
+    """Joint FLO estimator for pairwise mutual-information matrices.
+
+    The estimator creates one :class:`PairwiseCritic` whose ``MultiMLP``
+    encoder and symmetric potential are optimized jointly across all unique
+    pairs. The diagonal is excluded from training and reported as zero.
+
+    Parameters
+    ----------
+    encoder : MultiMLP
+        Parallel encoder for all count positions.
+    count : int
+        Number of variables in the input's penultimate dimension.
+    tau : float, default=1.0
+        Initial value of the learnable temperature parameter.
+    use_norm : bool, default=True
+        Whether to L2-normalize encoded representations.
+    """
+
+    def __init__(
+        self,
+        encoder: MultiMLP,
+        count: int,
+        tau: float = 1.0,
+        use_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        if count < 2:
+            raise ValueError("pairwise FLO requires count to be at least two")
+        self.count = count
+        self.critic = PairwiseCritic(
+            encoder=encoder,
+            count=count,
+            use_norm=use_norm,
+        )
+        self.tau = nn.Parameter(torch.as_tensor([tau]))
+
+    def compute_forward(self, batch: PairwiseMIBatch) -> PairwiseFLOOutput:
+        """Compute encoded representations and pairwise potentials.
+
+        Parameters
+        ----------
+        batch : PairwiseMIBatch
+            Observations with shape ``(*, count, features)``.
+
+        Returns
+        -------
+        PairwiseFLOOutput
+            Temperature-scaled representations and symmetric potentials.
+        """
+        hx = self.critic.encode(batch.x)
+        u = self.critic.compute_interactions(hx)
+        return PairwiseFLOOutput(
+            hx=hx / torch.sqrt(self.tau),
+            u=u,
+            batch_size=hx.shape[:-2],
+        )
+
+    def compute_objectives(
+        self,
+        predictions: PairwiseFLOOutput,
+    ) -> ObjectiveOutput:
+        """Compute the mean FLO objective over all unique pairs.
+
+        Parameters
+        ----------
+        predictions : PairwiseFLOOutput
+            Output previously returned by :meth:`compute_forward`.
+
+        Returns
+        -------
+        ObjectiveOutput
+            Scalar joint loss and pairwise diagnostics.
+        """
+        loss, details = pairwise_flo_loss(predictions)
+        return ObjectiveOutput(loss=loss, metrics=details, batch_size=[])
+
+    def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
+        """Estimate a symmetric pairwise mutual-information matrix.
+
+        Parameters
+        ----------
+        batch : PairwiseMIBatch
+            Observations with shape ``(*, count, features)``.
+
+        Returns
+        -------
+        MIEstimate
+            Estimate with shape ``(count, count)`` and a zero diagonal.
+        """
+        predictions = self.compute_forward(batch)
+        objective = self.compute_objectives(predictions)
+        details = objective.metrics
+        assert details is not None
+        return MIEstimate(
+            value=-details["loss_matrix"],
+            details=details,
+            batch_size=[],
+        )
+
+
+__all__ = [
+    "BilinearFLO",
+    "BilinearFLOOutput",
+    "PairwiseFLO",
+    "PairwiseFLOOutput",
+    "flo_loss",
+    "pairwise_flo_loss",
+]

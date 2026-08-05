@@ -14,5 +14,18 @@ dependencies = [
     "torch",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -4,26 +4,27 @@ from collections.abc import Sequence
 
 import torch
 from hyperpyyaml import load_hyperpyyaml
+from tensordict import TensorDict
 from torch import Tensor
 
 from shannonist.core import Brain, RunOpts, Stage, parse_arguments
 from shannonist.mi import BilinearFLO, BilinearFLOOutput, MIBatch
 
 
-class FLOBrain(Brain[dict[str, Tensor], BilinearFLOOutput]):
+class FLOBrain(Brain[TensorDict, BilinearFLOOutput]):
     """SpeechBrain-style training loop for a FLO estimator."""
 
     def compute_forward(
         self,
-        batch: dict[str, Tensor],
+        batch: TensorDict,
         stage: Stage,
     ) -> BilinearFLOOutput:
         """Construct an MI batch and run the FLO estimator.
 
         Parameters
         ----------
-        batch : dict[str, Tensor]
-            Dictionary containing paired ``x`` and ``y`` observations.
+        batch : TensorDict
+            TensorDict containing paired ``x`` and ``y`` observations.
         stage : Stage
             Current experiment stage.
 
@@ -47,7 +48,7 @@ class FLOBrain(Brain[dict[str, Tensor], BilinearFLOOutput]):
     def compute_objectives(
         self,
         predictions: BilinearFLOOutput,
-        batch: dict[str, Tensor],
+        batch: TensorDict,
         stage: Stage,
     ) -> Tensor:
         """Return the loss minimized by the training loop.
@@ -56,7 +57,7 @@ class FLOBrain(Brain[dict[str, Tensor], BilinearFLOOutput]):
         ----------
         predictions : BilinearFLOOutput
             FLO output produced by :meth:`compute_forward`.
-        batch : dict[str, Tensor]
+        batch : TensorDict
             Input batch. It is unused because FLO embeds its loss in the
             structured output.
         stage : Stage
