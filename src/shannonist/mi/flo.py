@@ -225,10 +225,13 @@ class PairwiseFLOOutput(TensorClass):
         ``(*, count, feature_dim)``.
     u : Tensor
         Symmetric FLO potentials with shape ``(*, count, count)``.
+    mask : Tensor
+        Boolean valid-position mask with shape ``(*, count)``.
     """
 
     hx: Tensor
     u: Tensor
+    mask: Tensor
 
 
 def pairwise_flo_loss(
@@ -236,10 +239,11 @@ def pairwise_flo_loss(
 ) -> tuple[Tensor, TensorDict]:
     """Compute jointly optimized FLO losses for all distinct pairs.
 
-    All leading dimensions are flattened into the sample dimension. FLO is
-    evaluated independently for every ordered pair, the two directions are
-    averaged to enforce symmetry, and the scalar training loss is the mean
-    over unique off-diagonal pairs.
+    All leading dimensions are flattened into the sample dimension. For pair
+    ``(i, j)``, only samples where both mask positions are valid participate in
+    positives, negatives, or averaging. FLO is evaluated independently for
+    every ordered pair, the two directions are averaged to enforce symmetry,
+    and the scalar training loss is the mean over unique off-diagonal pairs.
 
     Parameters
     ----------
@@ -256,62 +260,95 @@ def pairwise_flo_loss(
     Raises
     ------
     ValueError
-        If prediction shapes are incompatible or fewer than two samples are
-        available.
+        If prediction shapes are incompatible or any pair has fewer than two
+        jointly valid samples.
     """
     hx = predictions.hx
     u = predictions.u
+    mask = predictions.mask
     if hx.ndim < 3:
         raise ValueError("hx must have shape (*, count, feature_dim)")
     if u.shape != (*hx.shape[:-1], hx.shape[-2]):
         raise ValueError("u must have shape (*, count, count)")
+    if mask.shape != hx.shape[:-1]:
+        raise ValueError("mask must have shape (*, count)")
 
     count = hx.shape[-2]
     feature_dim = hx.shape[-1]
     hx = hx.reshape(-1, count, feature_dim)
     u = u.reshape(-1, count, count)
+    mask = mask.reshape(-1, count).bool()
     sample_count = hx.shape[0]
-    if sample_count < 2:
-        raise ValueError("pairwise FLO requires at least two samples")
+    zero = hx.sum() * 0
+    pair_losses: dict[tuple[int, int], Tensor] = {}
+    loss_vec = hx.new_zeros(sample_count, count, count)
+    valid_counts = torch.zeros(count, count, dtype=torch.long, device=hx.device)
 
+    for i in range(count):
+        for j in range(i + 1, count):
+            valid = mask[:, i] & mask[:, j]
+            valid_count = int(valid.sum().item())
+            if valid_count < 2:
+                raise ValueError(
+                    f"pair ({i}, {j}) has fewer than two jointly valid samples"
+                )
+
+            hx_i = hx[valid, i]
+            hx_j = hx[valid, j]
+            potential = u[valid, i, j]
+            directional_vectors = []
+            for left, right in ((hx_i, hx_j), (hx_j, hx_i)):
+                pair_similarity = left @ right.transpose(0, 1)
+                positive_mask = torch.eye(
+                    valid_count,
+                    dtype=torch.bool,
+                    device=hx.device,
+                )
+                g = pair_similarity[positive_mask]
+                g0 = pair_similarity[~positive_mask].reshape(
+                    valid_count,
+                    valid_count - 1,
+                )
+                directional_vectors.append(
+                    potential
+                    + torch.exp(
+                        -potential + torch.logsumexp(g0, dim=1) - g
+                    )
+                    / (valid_count - 1)
+                    - 1
+                )
+
+            pair_loss_vec = torch.stack(directional_vectors).mean(dim=0)
+            pair_loss = pair_loss_vec.mean()
+            pair_losses[(i, j)] = pair_loss
+            loss_vec[valid, i, j] = pair_loss_vec
+            loss_vec[valid, j, i] = pair_loss_vec
+            valid_counts[i, j] = valid_count
+            valid_counts[j, i] = valid_count
+
+    loss_matrix = torch.stack(
+        [
+            torch.stack(
+                [
+                    zero
+                    if i == j
+                    else pair_losses[(min(i, j), max(i, j))]
+                    for j in range(count)
+                ]
+            )
+            for i in range(count)
+        ]
+    )
+    loss = torch.stack(list(pair_losses.values())).mean()
     similarity = torch.einsum("nif,mjf->ijnm", hx, hx)
-    positive_mask = torch.eye(
-        sample_count,
-        dtype=torch.bool,
-        device=similarity.device,
-    )
-    g = similarity[..., positive_mask].reshape(count, count, sample_count)
-    g0 = similarity[..., ~positive_mask].reshape(
-        count,
-        count,
-        sample_count,
-        sample_count - 1,
-    )
-    g0_logsumexp = torch.logsumexp(g0, dim=-1)
-    u_by_pair = u.permute(1, 2, 0)
-    loss_vec = (
-        u_by_pair
-        + torch.exp(-u_by_pair + g0_logsumexp - g) / (sample_count - 1)
-        - 1
-    )
-    loss_matrix = loss_vec.mean(dim=-1)
-    loss_matrix = (loss_matrix + loss_matrix.transpose(0, 1)) / 2
-    off_diagonal = ~torch.eye(count, dtype=torch.bool, device=loss_matrix.device)
-    loss_matrix = loss_matrix.masked_fill(~off_diagonal, 0)
-    loss = loss_matrix[torch.triu(off_diagonal, diagonal=1)].mean()
-
-    symmetric_loss_vec = (loss_vec + loss_vec.transpose(0, 1)) / 2
-    symmetric_loss_vec = symmetric_loss_vec.permute(2, 0, 1)
-    symmetric_loss_vec = symmetric_loss_vec.masked_fill(
-        ~off_diagonal.unsqueeze(0),
-        0,
-    )
     details = TensorDict(
         {
-            "loss_vec": symmetric_loss_vec,
+            "loss_vec": loss_vec,
             "loss_matrix": loss_matrix,
             "similarity": similarity,
             "u": u,
+            "mask": mask,
+            "valid_counts": valid_counts,
         },
         batch_size=[],
     )
@@ -369,15 +406,49 @@ class PairwiseFLO(
         Returns
         -------
         PairwiseFLOOutput
-            Temperature-scaled representations and symmetric potentials.
+            Temperature-scaled representations, symmetric potentials, and the
+            normalized valid-position mask.
         """
         hx = self.critic.encode(batch.x)
         u = self.critic.compute_interactions(hx)
+        mask = self._normalize_mask(batch.x_mask, hx)
         return PairwiseFLOOutput(
             hx=hx / torch.sqrt(self.tau),
             u=u,
+            mask=mask,
             batch_size=hx.shape[:-2],
         )
+
+    def _normalize_mask(self, mask: Tensor | None, hx: Tensor) -> Tensor:
+        """Return a boolean mask with shape ``(*, count)``.
+
+        Parameters
+        ----------
+        mask : Tensor, optional
+            Input mask with shape ``(*, count)`` or ``(*, count, 1)``.
+        hx : Tensor
+            Encoded representations defining the expected leading shape.
+
+        Returns
+        -------
+        Tensor
+            Boolean valid-position mask.
+
+        Raises
+        ------
+        ValueError
+            If the mask shape is incompatible with the encoded input.
+        """
+        expected_shape = hx.shape[:-1]
+        if mask is None:
+            return torch.ones(expected_shape, dtype=torch.bool, device=hx.device)
+        if mask.shape == (*expected_shape, 1):
+            mask = mask.squeeze(-1)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                "x_mask must have shape (*, count) or (*, count, 1)"
+            )
+        return mask.to(device=hx.device, dtype=torch.bool)
 
     def compute_objectives(
         self,

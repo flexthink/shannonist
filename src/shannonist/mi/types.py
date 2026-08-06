@@ -51,9 +51,13 @@ class PairwiseMIBatch(TensorClass):
     ----------
     x : Tensor
         Observations with shape ``(batch, count, features)``.
+    x_mask : Tensor, optional
+        Valid-position mask with shape ``(batch, count)`` or
+        ``(batch, count, 1)``. Nonzero values identify present observations.
     """
 
     x: Tensor
+    x_mask: Tensor | None = None
 
 
 __all__ = ["MIBatch", "MIEstimate", "PairwiseMIBatch"]

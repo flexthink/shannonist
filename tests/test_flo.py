@@ -148,6 +148,7 @@ def test_pairwise_flo_shapes_symmetry_diagonal_and_gradients() -> None:
     assert isinstance(predictions, PairwiseFLOOutput)
     assert predictions.hx.shape == (12, count, 5)
     assert predictions.u.shape == (12, count, count)
+    assert torch.all(predictions.mask)
     assert objective.loss.requires_grad
     assert estimate.value.shape == (count, count)
     assert torch.equal(estimate.value, estimate.value.T)
@@ -220,5 +221,105 @@ def test_pairwise_flo_validates_count_and_sample_count() -> None:
 
     model = make_pairwise_flo()
     batch = PairwiseMIBatch(x=torch.randn(1, 3, 4), batch_size=[1])
-    with pytest.raises(ValueError, match="at least two samples"):
+    with pytest.raises(ValueError, match="two jointly valid samples"):
         model.compute_objectives(model.compute_forward(batch))
+
+
+def test_pairwise_flo_mask_is_equivalent_to_removing_samples() -> None:
+    model = make_pairwise_flo(count=2)
+    x = torch.randn(6, 2, 4)
+    mask = torch.tensor(
+        [
+            [1, 1],
+            [1, 0],
+            [1, 1],
+            [0, 1],
+            [1, 1],
+            [0, 0],
+        ],
+        dtype=torch.bool,
+    )
+    masked_batch = PairwiseMIBatch(
+        x=x,
+        x_mask=mask.unsqueeze(-1),
+        batch_size=[6],
+    )
+    valid = mask.all(dim=1)
+    filtered_batch = PairwiseMIBatch(x=x[valid], batch_size=[int(valid.sum())])
+
+    masked_predictions = model.compute_forward(masked_batch)
+    masked_objective = model.compute_objectives(masked_predictions)
+    filtered_objective = model.compute_objectives(model.compute_forward(filtered_batch))
+
+    assert masked_predictions.mask.shape == (6, 2)
+    assert torch.equal(masked_predictions.mask, mask)
+    assert torch.allclose(masked_objective.loss, filtered_objective.loss)
+    assert torch.allclose(
+        masked_objective.metrics["loss_matrix"],
+        filtered_objective.metrics["loss_matrix"],
+    )
+    assert masked_objective.metrics["valid_counts"][0, 1] == valid.sum()
+
+
+def test_pairwise_flo_masked_values_do_not_affect_loss() -> None:
+    model = make_pairwise_flo(count=2)
+    x = torch.randn(5, 2, 4)
+    mask = torch.tensor(
+        [[1, 1], [1, 0], [1, 1], [0, 1], [1, 1]],
+        dtype=torch.bool,
+    )
+    modified_x = x.clone()
+    modified_x[~mask] = 1_000_000
+
+    original = PairwiseMIBatch(x=x, x_mask=mask, batch_size=[5])
+    modified = PairwiseMIBatch(x=modified_x, x_mask=mask, batch_size=[5])
+    original_loss = model.compute_objectives(model.compute_forward(original)).loss
+    modified_loss = model.compute_objectives(model.compute_forward(modified)).loss
+
+    assert torch.allclose(original_loss, modified_loss)
+
+
+def test_pairwise_flo_mask_tracks_valid_counts_per_pair() -> None:
+    model = make_pairwise_flo(count=3)
+    mask = torch.tensor(
+        [
+            [1, 1, 1],
+            [1, 1, 0],
+            [1, 0, 1],
+            [0, 1, 1],
+        ],
+        dtype=torch.bool,
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(4, 3, 4),
+        x_mask=mask,
+        batch_size=[4],
+    )
+    objective = model.compute_objectives(model.compute_forward(batch))
+
+    expected_counts = torch.tensor(
+        [[0, 2, 2], [2, 0, 2], [2, 2, 0]],
+    )
+    assert torch.equal(objective.metrics["valid_counts"].cpu(), expected_counts)
+
+
+def test_pairwise_flo_validates_mask_shape_and_pair_coverage() -> None:
+    model = make_pairwise_flo(count=3)
+    invalid_shape = PairwiseMIBatch(
+        x=torch.randn(4, 3, 4),
+        x_mask=torch.ones(4, 2, dtype=torch.bool),
+        batch_size=[4],
+    )
+    with pytest.raises(ValueError, match="x_mask"):
+        model.compute_forward(invalid_shape)
+
+    insufficient = PairwiseMIBatch(
+        x=torch.randn(4, 3, 4),
+        x_mask=torch.tensor(
+            [[1, 1, 1], [1, 0, 1], [1, 0, 1], [1, 0, 1]],
+            dtype=torch.bool,
+        ),
+        batch_size=[4],
+    )
+    with pytest.raises(ValueError, match=r"pair \(0, 1\)"):
+        model.compute_objectives(model.compute_forward(insufficient))
