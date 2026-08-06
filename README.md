@@ -232,7 +232,9 @@ batch = MIBatch(
 
 Nonzero mask values identify valid positions. The schema supports these masks,
 but `BilinearFLO` does not yet implement masked estimation and raises
-`NotImplementedError` when either mask is supplied.
+`NotImplementedError` when either mask is supplied. `PairwiseFLO` supports an
+`x_mask` shaped `(*, count)` or `(*, count, 1)`: for pair `(i, j)`, a sample is
+completely excluded unless both mask positions are valid.
 
 ## Project status
 

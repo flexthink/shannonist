@@ -193,6 +193,128 @@ class PairwiseCritic(nn.Module):
         return (interaction + interaction.transpose(-2, -1)) / 2
 
 
+class SymmetricPairwiseCritic(nn.Module):
+    r"""Compute symmetric pairwise interactions with a shared encoder.
+
+    A single :class:`MLP` encodes every item in the input's penultimate
+    dimension using shared parameters. Pairwise scores are then computed as
+
+    .. math::
+
+        s_{ij} = h_i^\mathsf{T} W h_j, \qquad W = A^\mathsf{T} A.
+
+    The factorization makes ``W`` symmetric and positive semidefinite. Unlike
+    :class:`PairwiseCritic`, this critic has no fixed count: the number of
+    items may vary between calls.
+
+    Parameters
+    ----------
+    encoder : MLP
+        Shared encoder mapping each input feature vector to ``output_dim``.
+    use_norm : bool, default=True
+        Whether to L2-normalize encoded representations along their feature
+        dimension.
+
+    Attributes
+    ----------
+    A : nn.Parameter
+        Learned matrix whose Gram matrix defines the symmetric interaction.
+    """
+
+    def __init__(self, encoder: MLP, use_norm: bool = True) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.feature_dim = encoder.output_dim
+        self.use_norm = use_norm
+        self.A = nn.Parameter(torch.empty(self.feature_dim, self.feature_dim))
+        nn.init.xavier_uniform_(self.A)
+
+    @property
+    def weight(self) -> Tensor:
+        """Return the symmetric positive-semidefinite interaction matrix."""
+        return self.A.transpose(0, 1) @ self.A
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Compute every pairwise interaction score.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input with shape ``(*, count, input_features)``. ``count`` may
+            have any positive value.
+
+        Returns
+        -------
+        Tensor
+            Symmetric interaction matrix with shape ``(*, count, count)``.
+        """
+        return self.compute_interactions(self.encode(x))
+
+    def encode(self, x: Tensor) -> Tensor:
+        """Encode all items using the same MLP and optionally normalize them.
+
+        Parameters
+        ----------
+        x : Tensor
+            Input with shape ``(*, count, input_features)``.
+
+        Returns
+        -------
+        Tensor
+            Encoded input with shape ``(*, count, feature_dim)``.
+
+        Raises
+        ------
+        ValueError
+            If the input does not contain count and feature dimensions or its
+            feature dimension is incompatible with the encoder.
+        """
+        if x.ndim < 2:
+            raise ValueError("input must have shape (*, count, features)")
+        if x.shape[-2] <= 0:
+            raise ValueError("count dimension must be positive")
+        if x.shape[-1] != self.encoder.input_dim:
+            raise ValueError(
+                f"expected feature dimension {self.encoder.input_dim}, "
+                f"got {x.shape[-1]}"
+            )
+
+        flattened = x.reshape(-1, x.shape[-1])
+        hx = self.encoder(flattened).reshape(*x.shape[:-1], self.feature_dim)
+        if self.use_norm:
+            hx = F.normalize(hx, dim=-1)
+        return hx
+
+    def compute_interactions(self, hx: Tensor) -> Tensor:
+        """Compute symmetric interactions from encoded representations.
+
+        Parameters
+        ----------
+        hx : Tensor
+            Encoded representations with shape
+            ``(*, count, feature_dim)``.
+
+        Returns
+        -------
+        Tensor
+            Symmetric interaction matrix with shape ``(*, count, count)``.
+
+        Raises
+        ------
+        ValueError
+            If the encoded representation has an incompatible shape.
+        """
+        if hx.ndim < 2:
+            raise ValueError("encoded input must have shape (*, count, feature_dim)")
+        if hx.shape[-2] <= 0 or hx.shape[-1] != self.feature_dim:
+            raise ValueError(
+                "encoded input must have shape (*, count, feature_dim)"
+            )
+
+        interaction = (hx @ self.weight) @ hx.transpose(-2, -1)
+        return (interaction + interaction.transpose(-2, -1)) / 2
+
+
 class BilinearCriticOutput(TensorClass):
     """Output produced by :class:`BilinearCritic`.
 

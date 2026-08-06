@@ -5,6 +5,7 @@ from shannonist.models.critic import (
     BilinearCriticOutput,
     BilinearPotential,
     PairwiseCritic,
+    SymmetricPairwiseCritic,
 )
 from shannonist.models.mlp import MLP, MultiLinear, MultiMLP
 
@@ -16,4 +17,5 @@ __all__ = [
     "MultiLinear",
     "MultiMLP",
     "PairwiseCritic",
+    "SymmetricPairwiseCritic",
 ]

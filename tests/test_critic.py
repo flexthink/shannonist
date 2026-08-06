@@ -5,8 +5,10 @@ from torch import nn
 from shannonist.models import (
     BilinearCritic,
     BilinearCriticOutput,
+    MLP,
     MultiMLP,
     PairwiseCritic,
+    SymmetricPairwiseCritic,
 )
 
 
@@ -104,3 +106,35 @@ def test_pairwise_critic_validates_count_and_shapes() -> None:
         critic(torch.randn(5, 2, 2))
     with pytest.raises(ValueError, match="encoded input"):
         critic.compute_interactions(torch.randn(5, 3, 5))
+
+
+@pytest.mark.parametrize("count", [1, 3, 7])
+def test_symmetric_pairwise_critic_supports_arbitrary_counts(count: int) -> None:
+    encoder = MLP(3, output_dim=5, hidden_dim=(6,))
+    critic = SymmetricPairwiseCritic(encoder, use_norm=False)
+    x = torch.randn(2, 4, count, 3)
+
+    hx = critic.encode(x)
+    expected_hx = encoder(x.reshape(-1, 3)).reshape(2, 4, count, 5)
+    output = critic.compute_interactions(hx)
+
+    assert torch.allclose(hx, expected_hx)
+    assert output.shape == (2, 4, count, count)
+    assert torch.equal(output, output.transpose(-2, -1))
+    assert torch.allclose(critic.weight, critic.weight.T)
+    assert torch.linalg.eigvalsh(critic.weight).min() >= -1e-6
+
+    output.sum().backward()
+    assert critic.A.grad is not None
+    assert next(encoder.parameters()).grad is not None
+
+
+def test_symmetric_pairwise_critic_normalizes_and_validates_shapes() -> None:
+    critic = SymmetricPairwiseCritic(MLP(2, output_dim=4, hidden_dim=()))
+    hx = critic.encode(torch.randn(5, 6, 2))
+
+    assert torch.allclose(hx.norm(dim=-1), torch.ones(5, 6), atol=1e-6)
+    with pytest.raises(ValueError, match="feature dimension"):
+        critic(torch.randn(5, 6, 3))
+    with pytest.raises(ValueError, match="encoded input"):
+        critic.compute_interactions(torch.randn(5, 6, 5))

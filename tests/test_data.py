@@ -7,8 +7,10 @@ from torch.utils.data import DataLoader
 
 from shannonist.mi import (
     CorrelatedGausian,
+    LatentPairwiseCorrelatentGaussian,
     PairwiseCorrelatedGaussian,
     tensordict_collate,
+    tensordict_passthrough,
 )
 
 
@@ -81,6 +83,12 @@ def test_correlated_gaussian_validates_indices() -> None:
 def test_tensordict_collate_rejects_empty_sequences() -> None:
     with pytest.raises(ValueError, match="empty"):
         tensordict_collate([])
+
+
+def test_tensordict_passthrough_preserves_dataset_batch() -> None:
+    batch = TensorDict({"x": torch.randn(3, 2)}, batch_size=[3])
+
+    assert tensordict_passthrough(batch) is batch
 
 
 def test_pairwise_correlated_gaussian_factor_and_shapes() -> None:
@@ -190,5 +198,105 @@ def test_pairwise_correlated_gaussian_validates_dimensions_and_indices() -> None
         PairwiseCorrelatedGaussian(mutual_information, num_samples=-1)
 
     dataset = PairwiseCorrelatedGaussian(mutual_information, num_samples=2)
+    with pytest.raises(IndexError):
+        dataset[2]
+
+
+def test_latent_pairwise_correlatent_gaussian_batch_and_contexts() -> None:
+    torch.manual_seed(11)
+    mutual_information = torch.full((3, 3), 0.2)
+    mutual_information.fill_diagonal_(0)
+    dataset = LatentPairwiseCorrelatentGaussian(
+        count=8,
+        batch_size=5,
+        mutual_information=mutual_information,
+        dim=2,
+        num_batches=7,
+    )
+
+    batch = dataset[0]
+
+    assert len(dataset) == 7
+    assert batch.batch_size == torch.Size([5])
+    assert batch["x"].shape == (5, 3, 2)
+    assert batch["z"].shape == (5, 2)
+    assert batch["component_index"].shape == (5,)
+    assert batch["component_index"].unique().numel() == 5
+    assert torch.allclose(
+        dataset.factor @ dataset.factor.T,
+        dataset.correlation,
+        atol=1e-6,
+    )
+    reconstructed = dataset.residual_correlation + dataset.context_strength
+    assert torch.allclose(reconstructed, dataset.correlation, atol=1e-6)
+    assert torch.allclose(
+        dataset.residual_factor @ dataset.residual_factor.T,
+        dataset.residual_correlation,
+        atol=1e-6,
+    )
+
+
+def test_latent_pairwise_correlatent_gaussian_preserves_marginal_mi() -> None:
+    torch.manual_seed(13)
+    target = 0.25
+    dim = 2
+    mutual_information = torch.full((3, 3), target)
+    mutual_information.fill_diagonal_(0)
+    dataset = LatentPairwiseCorrelatentGaussian(
+        count=10,
+        batch_size=5,
+        mutual_information=mutual_information,
+        dim=dim,
+        num_batches=1_600,
+    )
+    samples = []
+    for index in range(len(dataset)):
+        batch = dataset[index]
+        samples.append(batch["x"])
+    x = torch.cat(samples)
+
+    for i in range(3):
+        for j in range(i + 1, 3):
+            correlation = torch.corrcoef(
+                torch.stack((x[:, i].flatten(), x[:, j].flatten()))
+            )[0, 1]
+            empirical_mi = -dim / 2 * torch.log1p(-(correlation**2))
+            assert empirical_mi.item() == pytest.approx(target, abs=0.04)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"count": 0, "batch_size": 2}, "count"),
+        ({"count": 3, "batch_size": 1}, "at least two"),
+        ({"count": 2, "batch_size": 3}, "exceed count"),
+        ({"count": 3, "batch_size": 2, "dim": 0}, "dim"),
+        ({"count": 3, "batch_size": 2, "num_batches": -1}, "num_batches"),
+        (
+            {"count": 3, "batch_size": 2, "context_fraction": 1.1},
+            "context_fraction",
+        ),
+    ],
+)
+def test_latent_pairwise_correlatent_gaussian_validates_constructor(
+    kwargs: dict[str, int | float],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        LatentPairwiseCorrelatentGaussian(
+            mutual_information=[[0.0, 0.1], [0.1, 0.0]],
+            **kwargs,
+        )
+
+
+def test_latent_pairwise_correlatent_gaussian_validates_indices() -> None:
+    dataset = LatentPairwiseCorrelatentGaussian(
+        count=3,
+        batch_size=2,
+        mutual_information=[[0.0, 0.1], [0.1, 0.0]],
+        num_batches=2,
+    )
+
+    assert dataset[-1]["x"].shape == (2, 2, 1)
     with pytest.raises(IndexError):
         dataset[2]

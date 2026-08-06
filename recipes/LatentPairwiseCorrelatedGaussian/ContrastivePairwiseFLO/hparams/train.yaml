@@ -1,0 +1,73 @@
+seed: 1337
+
+# Five positions per sequence. The context consumes part of the covariance
+# already specified by this matrix, so this remains the exact unconditional MI.
+mutual_information:
+    - [0.0, 0.30, 0.12, 0.05, 0.18]
+    - [0.30, 0.0, 0.22, 0.08, 0.14]
+    - [0.12, 0.22, 0.0, 0.27, 0.10]
+    - [0.05, 0.08, 0.27, 0.0, 0.20]
+    - [0.18, 0.14, 0.10, 0.20, 0.0]
+sequence_length: 5
+latent_count: 10
+dim: 20
+
+# Every dataset item is already a complete batch. It samples distinct latent
+# components without replacement, so this value belongs to the dataset rather
+# than the DataLoader.
+batch_size: 8
+train_batches: 2048
+valid_batches: 256
+
+# Training
+number_of_epochs: 20
+lr: 0.0001
+
+# Model
+sample_size: 5
+feature_dim: 64
+encoder_hidden_dims: [128, 128]
+
+train_set: !new:shannonist.mi.LatentPairwiseCorrelatentGaussian
+    count: !ref <latent_count>
+    batch_size: !ref <batch_size>
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_batches: !ref <train_batches>
+    context_fraction: 0.5
+
+valid_set: !new:shannonist.mi.LatentPairwiseCorrelatentGaussian
+    count: !ref <latent_count>
+    batch_size: !ref <batch_size>
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_batches: !ref <valid_batches>
+    context_fraction: 0.5
+
+encoder: !new:shannonist.models.MLP
+    input_dim: !ref <dim>
+    output_dim: !ref <feature_dim>
+    hidden_dim: !ref <encoder_hidden_dims>
+
+estimator: !new:shannonist.mi.ContrastivePairwiseFLO
+    encoder: !ref <encoder>
+    sample_size: !ref <sample_size>
+    tau: 1.0
+    use_norm: True
+
+optimizer: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+# Do not set DataLoader.batch_size: batching is performed by the dataset so
+# latent components can be selected without replacement within each batch.
+train_loader_kwargs:
+    batch_size: null
+    shuffle: True
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_passthrough
+
+valid_loader_kwargs:
+    batch_size: null
+    shuffle: False
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_passthrough

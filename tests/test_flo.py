@@ -5,10 +5,13 @@ from torch import nn
 
 from shannonist.mi import (
     BilinearFLO,
+    ContrastivePairwiseFLO,
+    ContrastivePairwiseFLOOutput,
     MIBatch,
     PairwiseFLO,
     PairwiseFLOOutput,
     PairwiseMIBatch,
+    contrastive_pairwise_flo_loss,
     flo_loss,
     pairwise_flo_loss,
 )
@@ -455,3 +458,123 @@ def test_pairwise_flo_validates_mask_shape_and_pair_coverage() -> None:
     )
     with pytest.raises(ValueError, match=r"pair \(0, 1\)"):
         model.compute_objectives(model.compute_forward(insufficient))
+
+
+def test_contrastive_pairwise_flo_samples_masked_sequences() -> None:
+    torch.manual_seed(7)
+    model = ContrastivePairwiseFLO(
+        MLP(4, output_dim=5, hidden_dim=(6,)),
+        sample_size=4,
+    )
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1, 0],
+            [1, 0, 1, 0, 1, 0],
+            [0, 1, 1, 1, 1, 0],
+        ],
+        dtype=torch.bool,
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(3, 6, 4),
+        x_mask=mask.unsqueeze(-1),
+        batch_size=[3],
+    )
+
+    predictions = model.compute_forward(batch)
+    objective = model.compute_objectives(predictions)
+
+    assert isinstance(predictions, ContrastivePairwiseFLOOutput)
+    assert predictions.batch_size == torch.Size([3, 3])
+    assert predictions.hx.shape == (3, 3, 2, 5)
+    assert predictions.u.shape == (3, 3, 2, 2)
+    assert predictions.position_indices.shape == (3, 3, 2)
+    selected_mask = mask[
+        torch.arange(3)[:, None, None],
+        predictions.position_indices,
+    ]
+    assert selected_mask.all()
+    assert torch.all(
+        predictions.position_indices[..., 0]
+        != predictions.position_indices[..., 1]
+    )
+    valid_ordinals = mask.cumsum(dim=-1) - 1
+    sampled_ordinals = valid_ordinals[
+        torch.arange(3)[:, None, None],
+        predictions.position_indices,
+    ]
+    assert torch.equal(
+        sampled_ordinals,
+        sampled_ordinals[:1].expand_as(sampled_ordinals),
+    )
+    assert objective.loss.requires_grad
+    assert objective.metrics["loss_vec"].shape == (3, 3)
+    assert objective.metrics["similarity"].shape == (3, 2, 3, 3)
+
+    objective.loss.backward()
+    assert model.critic.A.grad is not None
+    assert next(model.critic.encoder.parameters()).grad is not None
+
+
+def test_contrastive_pairwise_flo_loss_matches_explicit_formula() -> None:
+    model = ContrastivePairwiseFLO(
+        MLP(3, output_dim=4, hidden_dim=()),
+        sample_size=2,
+        use_norm=False,
+    )
+    batch = PairwiseMIBatch(x=torch.randn(4, 5, 3), batch_size=[4])
+    predictions = model.compute_forward(batch)
+    loss, details = contrastive_pairwise_flo_loss(predictions)
+    directional_losses = []
+    independent = ~torch.eye(4, dtype=torch.bool)
+
+    for pair_index in range(2):
+        pair_directions = []
+        potential = predictions.u[:, pair_index, 0, 1]
+        for left, right in ((0, 1), (1, 0)):
+            similarity = (
+                predictions.hx[:, pair_index, left]
+                @ predictions.hx[:, pair_index, right].T
+            )
+            joint = similarity.diag()
+            negatives = similarity[independent].reshape(4, 3)
+            pair_directions.append(
+                potential
+                + torch.exp(
+                    -potential
+                    + torch.logsumexp(negatives, dim=-1)
+                    - joint
+                )
+                / 3
+                - 1
+            )
+        directional_losses.append(torch.stack(pair_directions).mean(dim=0))
+
+    expected = torch.stack(directional_losses, dim=1)
+    assert torch.allclose(details["loss_vec"], expected, atol=1e-6)
+    assert torch.allclose(loss, expected.mean(), atol=1e-6)
+
+
+def test_contrastive_pairwise_flo_validates_batch_masks_and_sample_size() -> None:
+    with pytest.raises(ValueError, match="sample_size"):
+        ContrastivePairwiseFLO(MLP(2, output_dim=3), sample_size=0)
+
+    model = ContrastivePairwiseFLO(MLP(2, output_dim=3), sample_size=2)
+    single = PairwiseMIBatch(x=torch.randn(1, 4, 2), batch_size=[1])
+    with pytest.raises(ValueError, match="batch size"):
+        model.compute_forward(single)
+
+    empty = PairwiseMIBatch(
+        x=torch.randn(2, 4, 2),
+        x_mask=torch.tensor([[1, 1, 0, 0], [0, 0, 0, 0]]),
+        batch_size=[2],
+    )
+    with pytest.raises(ValueError, match="at least one valid"):
+        model.compute_forward(empty)
+
+    invalid_mask = PairwiseMIBatch(
+        x=torch.randn(2, 4, 2),
+        x_mask=torch.ones(2, 3, dtype=torch.bool),
+        batch_size=[2],
+    )
+    with pytest.raises(ValueError, match="x_mask"):
+        model.compute_forward(invalid_mask)

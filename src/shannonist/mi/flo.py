@@ -8,8 +8,9 @@ from shannonist.models.critic import (
     BilinearCritic,
     BilinearCriticOutput,
     PairwiseCritic,
+    SymmetricPairwiseCritic,
 )
-from shannonist.models.mlp import MultiMLP
+from shannonist.models.mlp import MLP, MultiMLP
 
 
 class BilinearFLOOutput(TensorClass):
@@ -483,11 +484,342 @@ class PairwiseFLO(
         )
 
 
+class ContrastivePairwiseFLOOutput(TensorClass):
+    """Predictions produced by contrastive pairwise FLO.
+
+    Parameters
+    ----------
+    hx : Tensor
+        Temperature-scaled representations with shape
+        ``(batch, num_samples, 2, feature_dim)``.
+    u : Tensor
+        Symmetric critic potentials with shape
+        ``(batch, num_samples, 2, 2)``.
+    position_indices : Tensor
+        Sampled sequence indices with shape ``(batch, num_samples, 2)``.
+    """
+
+    hx: Tensor
+    u: Tensor
+    position_indices: Tensor
+
+
+def contrastive_pairwise_flo_loss(
+    predictions: ContrastivePairwiseFLOOutput,
+) -> tuple[Tensor, TensorDict]:
+    """Compute FLO over sampled within-sequence position pairs.
+
+    Each sampled pair slot defines a separate FLO problem across the batch.
+    Matching batch indices are joint observations; non-matching batch indices
+    are product-of-marginals observations. The two interaction directions are
+    averaged, followed by averaging over sampled pairs and batch items.
+
+    Parameters
+    ----------
+    predictions : ContrastivePairwiseFLOOutput
+        Encoded sampled pairs and their symmetric potentials.
+
+    Returns
+    -------
+    tuple[Tensor, TensorDict]
+        Scalar mean loss and diagnostic tensors.
+
+    Raises
+    ------
+    ValueError
+        If prediction shapes are incompatible or the batch contains fewer
+        than two samples.
+    """
+    hx = predictions.hx
+    u = predictions.u
+    position_indices = predictions.position_indices
+    if hx.ndim != 4 or hx.shape[-2] != 2:
+        raise ValueError(
+            "hx must have shape (batch, num_samples, 2, feature_dim)"
+        )
+    batch_size, num_samples = hx.shape[:2]
+    if batch_size < 2:
+        raise ValueError("contrastive pairwise FLO requires batch size >= 2")
+    if num_samples < 1:
+        raise ValueError("at least one sampled position pair is required")
+    if u.shape != (batch_size, num_samples, 2, 2):
+        raise ValueError("u must have shape (batch, num_samples, 2, 2)")
+    if position_indices.shape != (batch_size, num_samples, 2):
+        raise ValueError(
+            "position_indices must have shape (batch, num_samples, 2)"
+        )
+
+    left = hx[:, :, 0]
+    right = hx[:, :, 1]
+    forward_similarity = torch.einsum("bnf,cnf->nbc", left, right)
+    reverse_similarity = torch.einsum("bnf,cnf->nbc", right, left)
+    similarity = torch.stack((forward_similarity, reverse_similarity), dim=1)
+
+    independent = ~torch.eye(
+        batch_size,
+        dtype=torch.bool,
+        device=hx.device,
+    )
+    joint = similarity.diagonal(dim1=-2, dim2=-1)
+    independent_logsumexp = similarity.masked_fill(
+        ~independent,
+        -torch.inf,
+    ).logsumexp(dim=-1)
+
+    potential = u[:, :, 0, 1].transpose(0, 1).unsqueeze(1)
+    directed_loss = (
+        potential
+        + torch.exp(-potential + independent_logsumexp - joint)
+        / (batch_size - 1)
+        - 1
+    )
+    loss_vec = directed_loss.mean(dim=1).transpose(0, 1)
+    loss_by_pair = loss_vec.mean(dim=0)
+    loss = loss_by_pair.mean()
+
+    details = TensorDict(
+        {
+            "loss_vec": loss_vec,
+            "loss_by_pair": loss_by_pair,
+            "similarity": similarity,
+            "u": u,
+            "position_indices": position_indices,
+        },
+        batch_size=[],
+    )
+    return loss, details
+
+
+class ContrastivePairwiseFLO(
+    nn.Module,
+    TrainableEstimator[
+        PairwiseMIBatch,
+        ContrastivePairwiseFLOOutput,
+        MIEstimate,
+    ],
+):
+    """Estimate MI between randomly sampled positions in sequences.
+
+    A shared encoder is applied to both members of every position pair. For
+    each sampled pair slot, aligned batch items form the joint distribution
+    and all differently indexed batch items form the independent distribution.
+    Padded positions are never sampled.
+
+    Parameters
+    ----------
+    encoder : MLP
+        Encoder shared by every sequence position.
+    sample_size : int
+        Maximum number of position pairs sampled per sequence and pass. The
+        actual number is capped by the smallest valid sequence length in the
+        batch.
+    tau : float, default=1.0
+        Initial value of the learnable temperature parameter.
+    use_norm : bool, default=True
+        Whether to L2-normalize encoded representations.
+    """
+
+    def __init__(
+        self,
+        encoder: MLP,
+        sample_size: int,
+        tau: float = 1.0,
+        use_norm: bool = True,
+    ) -> None:
+        super().__init__()
+        if sample_size <= 0:
+            raise ValueError("sample_size must be positive")
+        self.sample_size = sample_size
+        self.critic = SymmetricPairwiseCritic(
+            encoder=encoder,
+            use_norm=use_norm,
+        )
+        self.tau = nn.Parameter(torch.as_tensor([tau]))
+
+    def compute_forward(
+        self,
+        batch: PairwiseMIBatch,
+    ) -> ContrastivePairwiseFLOOutput:
+        """Sample valid position pairs and evaluate the shared critic.
+
+        Parameters
+        ----------
+        batch : PairwiseMIBatch
+            Sequence observations with shape ``(*, length, features)`` and an
+            optional mask of shape ``(*, length)`` or ``(*, length, 1)``.
+            Leading dimensions are flattened into one mandatory batch axis.
+
+        Returns
+        -------
+        ContrastivePairwiseFLOOutput
+            Encoded pairs, potentials, and their source position indices.
+
+        Raises
+        ------
+        ValueError
+            If input or mask shapes are invalid, the flattened batch has fewer
+            than two items, or a sample has no valid positions.
+        """
+        x = batch.x
+        if x.ndim < 3:
+            raise ValueError("x must have shape (*, length, features)")
+        length, feature_dim = x.shape[-2:]
+        x = x.reshape(-1, length, feature_dim)
+        batch_size = x.shape[0]
+        if batch_size < 2:
+            raise ValueError("contrastive pairwise FLO requires batch size >= 2")
+
+        mask = self._normalize_mask(batch.x_mask, batch.x)
+        mask = mask.reshape(batch_size, length)
+        valid_counts = mask.sum(dim=-1)
+        minimum_valid = int(valid_counts.min().item())
+        if minimum_valid < 1:
+            raise ValueError("every sample must contain at least one valid position")
+        num_samples = min(self.sample_size, minimum_valid)
+        position_indices = self._sample_position_pairs(mask, num_samples)
+
+        batch_indices = torch.arange(batch_size, device=x.device)[:, None, None]
+        sampled = x[batch_indices, position_indices]
+        hx = self.critic.encode(sampled)
+        u = self.critic.compute_interactions(hx)
+        return ContrastivePairwiseFLOOutput(
+            hx=hx / torch.sqrt(self.tau),
+            u=u,
+            position_indices=position_indices,
+            batch_size=[batch_size, num_samples],
+        )
+
+    @staticmethod
+    def _normalize_mask(mask: Tensor | None, x: Tensor) -> Tensor:
+        """Return a boolean mask matching the sequence dimensions.
+
+        Parameters
+        ----------
+        mask : Tensor, optional
+            Mask with shape ``(*, length)`` or ``(*, length, 1)``.
+        x : Tensor
+            Input with shape ``(*, length, features)``.
+
+        Returns
+        -------
+        Tensor
+            Boolean mask with shape ``(*, length)``.
+        """
+        expected_shape = x.shape[:-1]
+        if mask is None:
+            return torch.ones(expected_shape, dtype=torch.bool, device=x.device)
+        if mask.shape == (*expected_shape, 1):
+            mask = mask.squeeze(-1)
+        if mask.shape != expected_shape:
+            raise ValueError(
+                "x_mask must have shape (*, length) or (*, length, 1)"
+            )
+        return mask.to(device=x.device, dtype=torch.bool)
+
+    @staticmethod
+    def _sample_position_pairs(mask: Tensor, num_samples: int) -> Tensor:
+        """Sample position-matched pairs without selecting masked positions.
+
+        Positions are matched across samples by valid-token ordinal. Thus a
+        sampled pair of ordinals is shared by the whole batch, even when mask
+        layouts differ. The first ordinals are sampled without replacement.
+        Whenever all samples have at least two valid positions, the second
+        ordinal differs from the first. A one-position sequence necessarily
+        pairs that position with itself.
+
+        Parameters
+        ----------
+        mask : Tensor
+            Boolean validity mask with shape ``(batch, length)``.
+        num_samples : int
+            Number of pairs to draw for every batch item.
+
+        Returns
+        -------
+        Tensor
+            Sampled indices with shape ``(batch, num_samples, 2)``.
+        """
+        minimum_valid = int(mask.sum(dim=-1).min().item())
+        left_ordinals = torch.randperm(
+            minimum_valid,
+            device=mask.device,
+        )[:num_samples]
+        if minimum_valid == 1:
+            right_ordinals = left_ordinals
+        else:
+            right_ordinals = torch.randint(
+                minimum_valid - 1,
+                (num_samples,),
+                device=mask.device,
+            )
+            right_ordinals = right_ordinals + (
+                right_ordinals >= left_ordinals
+            )
+
+        valid_positions = torch.stack(
+            [
+                sample_mask.nonzero(as_tuple=False).squeeze(-1)[:minimum_valid]
+                for sample_mask in mask
+            ]
+        )
+        left = valid_positions[:, left_ordinals]
+        right = valid_positions[:, right_ordinals]
+        return torch.stack((left, right), dim=-1)
+
+    def compute_objectives(
+        self,
+        predictions: ContrastivePairwiseFLOOutput,
+    ) -> ObjectiveOutput:
+        """Compute the mean FLO objective over sampled position pairs.
+
+        Parameters
+        ----------
+        predictions : ContrastivePairwiseFLOOutput
+            Output previously returned by :meth:`compute_forward`.
+
+        Returns
+        -------
+        ObjectiveOutput
+            Scalar FLO loss and pair-level diagnostics.
+        """
+        loss, details = contrastive_pairwise_flo_loss(predictions)
+        return ObjectiveOutput(loss=loss, metrics=details, batch_size=[])
+
+    def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
+        """Estimate mean MI across newly sampled sequence-position pairs.
+
+        Parameters
+        ----------
+        batch : PairwiseMIBatch
+            Masked or unmasked sequence observations.
+
+        Returns
+        -------
+        MIEstimate
+            Scalar sampled FLO lower bound and diagnostic tensors.
+        """
+        predictions = self.compute_forward(batch)
+        objective = self.compute_objectives(predictions)
+        return MIEstimate(
+            value=-objective.loss,
+            details=objective.metrics,
+            batch_size=[],
+        )
+
+
+# Compatibility with the spelling originally requested in the public API.
+ContrastivePairwiseFLow = ContrastivePairwiseFLO
+
+
 __all__ = [
     "BilinearFLO",
     "BilinearFLOOutput",
+    "ContrastivePairwiseFLO",
+    "ContrastivePairwiseFLow",
+    "ContrastivePairwiseFLOOutput",
     "PairwiseFLO",
     "PairwiseFLOOutput",
+    "contrastive_pairwise_flo_loss",
     "flo_loss",
     "pairwise_flo_loss",
 ]
