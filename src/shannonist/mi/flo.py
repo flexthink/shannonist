@@ -279,68 +279,58 @@ def pairwise_flo_loss(
     u = u.reshape(-1, count, count)
     mask = mask.reshape(-1, count).bool()
     sample_count = hx.shape[0]
-    zero = hx.sum() * 0
-    pair_losses: dict[tuple[int, int], Tensor] = {}
-    loss_vec = hx.new_zeros(sample_count, count, count)
-    valid_counts = torch.zeros(count, count, dtype=torch.long, device=hx.device)
 
-    for i in range(count):
-        for j in range(i + 1, count):
-            valid = mask[:, i] & mask[:, j]
-            valid_count = int(valid.sum().item())
-            if valid_count < 2:
-                raise ValueError(
-                    f"pair ({i}, {j}) has fewer than two jointly valid samples"
-                )
-
-            hx_i = hx[valid, i]
-            hx_j = hx[valid, j]
-            potential = u[valid, i, j]
-            directional_vectors = []
-            for left, right in ((hx_i, hx_j), (hx_j, hx_i)):
-                pair_similarity = left @ right.transpose(0, 1)
-                positive_mask = torch.eye(
-                    valid_count,
-                    dtype=torch.bool,
-                    device=hx.device,
-                )
-                g = pair_similarity[positive_mask]
-                g0 = pair_similarity[~positive_mask].reshape(
-                    valid_count,
-                    valid_count - 1,
-                )
-                directional_vectors.append(
-                    potential
-                    + torch.exp(
-                        -potential + torch.logsumexp(g0, dim=1) - g
-                    )
-                    / (valid_count - 1)
-                    - 1
-                )
-
-            pair_loss_vec = torch.stack(directional_vectors).mean(dim=0)
-            pair_loss = pair_loss_vec.mean()
-            pair_losses[(i, j)] = pair_loss
-            loss_vec[valid, i, j] = pair_loss_vec
-            loss_vec[valid, j, i] = pair_loss_vec
-            valid_counts[i, j] = valid_count
-            valid_counts[j, i] = valid_count
-
-    loss_matrix = torch.stack(
-        [
-            torch.stack(
-                [
-                    zero
-                    if i == j
-                    else pair_losses[(min(i, j), max(i, j))]
-                    for j in range(count)
-                ]
-            )
-            for i in range(count)
-        ]
+    # A sample belongs to pair (i, j) only if both variable positions exist.
+    pair_valid = mask.transpose(0, 1).unsqueeze(1) & mask.transpose(0, 1).unsqueeze(0)
+    pair_counts = pair_valid.sum(dim=-1)
+    upper_triangle = torch.triu(
+        torch.ones(count, count, dtype=torch.bool, device=hx.device),
+        diagonal=1,
     )
-    loss = torch.stack(list(pair_losses.values())).mean()
+    diagonal = torch.eye(count, dtype=torch.bool, device=hx.device)
+    insufficient = upper_triangle & (pair_counts < 2)
+    if insufficient.any():
+        i, j = insufficient.nonzero(as_tuple=False)[0].tolist()
+        raise ValueError(
+            f"pair ({i}, {j}) has fewer than two jointly valid samples"
+        )
+
     similarity = torch.einsum("nif,mjf->ijnm", hx, hx)
+    identity = torch.eye(sample_count, dtype=torch.bool, device=hx.device)
+    valid_combinations = pair_valid.unsqueeze(-1) & pair_valid.unsqueeze(-2)
+    negative_mask = valid_combinations & ~identity
+    g = similarity.diagonal(dim1=-2, dim2=-1)
+    g0_logsumexp = similarity.masked_fill(~negative_mask, -torch.inf).logsumexp(
+        dim=-1
+    )
+
+    u_by_pair = u.permute(1, 2, 0)
+    pair_indices = torch.arange(count, device=hx.device)
+    canonical_direction = pair_indices[:, None] <= pair_indices[None, :]
+    symmetric_u = torch.where(
+        canonical_direction.unsqueeze(-1),
+        u_by_pair,
+        u_by_pair.transpose(0, 1),
+    )
+    denominator = (pair_counts - 1).clamp_min(1).unsqueeze(-1)
+    directed_loss_vec = (
+        symmetric_u
+        + torch.exp(-symmetric_u + g0_logsumexp - g) / denominator
+        - 1
+    )
+    directed_loss_vec = directed_loss_vec.masked_fill(~pair_valid, 0)
+    symmetric_loss_vec = (
+        directed_loss_vec + directed_loss_vec.transpose(0, 1)
+    ) / 2
+    symmetric_loss_vec = symmetric_loss_vec.masked_fill(
+        diagonal.unsqueeze(-1),
+        0,
+    )
+    loss_vec = symmetric_loss_vec.permute(2, 0, 1)
+    loss_matrix = symmetric_loss_vec.sum(dim=-1) / pair_counts.clamp_min(1)
+    loss_matrix = loss_matrix.masked_fill(diagonal, 0)
+    loss = loss_matrix[upper_triangle].mean()
+    valid_counts = pair_counts.masked_fill(diagonal, 0)
     details = TensorDict(
         {
             "loss_vec": loss_vec,

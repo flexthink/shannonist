@@ -1,5 +1,6 @@
 import pytest
 import torch
+from tensordict import TensorDict
 from torch import nn
 
 from shannonist.mi import (
@@ -9,6 +10,7 @@ from shannonist.mi import (
     PairwiseFLOOutput,
     PairwiseMIBatch,
     flo_loss,
+    pairwise_flo_loss,
 )
 from shannonist.models import BilinearPotential, MLP, MultiMLP
 
@@ -131,6 +133,136 @@ def make_pairwise_flo(count: int = 3) -> PairwiseFLO:
         MultiMLP(4, count=count, output_dim=5, hidden_dim=(7,)),
         count=count,
     )
+
+
+def pairwise_flo_loss_ref(
+    predictions: PairwiseFLOOutput,
+) -> tuple[torch.Tensor, TensorDict]:
+    """Reference loop implementation of masked pairwise FLO."""
+    hx = predictions.hx
+    u = predictions.u
+    mask = predictions.mask
+    if hx.ndim < 3:
+        raise ValueError("hx must have shape (*, count, feature_dim)")
+    if u.shape != (*hx.shape[:-1], hx.shape[-2]):
+        raise ValueError("u must have shape (*, count, count)")
+    if mask.shape != hx.shape[:-1]:
+        raise ValueError("mask must have shape (*, count)")
+
+    count = hx.shape[-2]
+    feature_dim = hx.shape[-1]
+    hx = hx.reshape(-1, count, feature_dim)
+    u = u.reshape(-1, count, count)
+    mask = mask.reshape(-1, count).bool()
+    sample_count = hx.shape[0]
+    zero = hx.sum() * 0
+    pair_losses: dict[tuple[int, int], torch.Tensor] = {}
+    loss_vec = hx.new_zeros(sample_count, count, count)
+    valid_counts = torch.zeros(count, count, dtype=torch.long, device=hx.device)
+
+    for i in range(count):
+        for j in range(i + 1, count):
+            valid = mask[:, i] & mask[:, j]
+            valid_count = int(valid.sum().item())
+            if valid_count < 2:
+                raise ValueError(
+                    f"pair ({i}, {j}) has fewer than two jointly valid samples"
+                )
+
+            hx_i = hx[valid, i]
+            hx_j = hx[valid, j]
+            potential = u[valid, i, j]
+            directional_vectors = []
+            for left, right in ((hx_i, hx_j), (hx_j, hx_i)):
+                pair_similarity = left @ right.transpose(0, 1)
+                positive_mask = torch.eye(
+                    valid_count,
+                    dtype=torch.bool,
+                    device=hx.device,
+                )
+                g = pair_similarity[positive_mask]
+                g0 = pair_similarity[~positive_mask].reshape(
+                    valid_count,
+                    valid_count - 1,
+                )
+                directional_vectors.append(
+                    potential
+                    + torch.exp(
+                        -potential + torch.logsumexp(g0, dim=1) - g
+                    )
+                    / (valid_count - 1)
+                    - 1
+                )
+
+            pair_loss_vec = torch.stack(directional_vectors).mean(dim=0)
+            pair_loss = pair_loss_vec.mean()
+            pair_losses[(i, j)] = pair_loss
+            loss_vec[valid, i, j] = pair_loss_vec
+            loss_vec[valid, j, i] = pair_loss_vec
+            valid_counts[i, j] = valid_count
+            valid_counts[j, i] = valid_count
+
+    loss_matrix = torch.stack(
+        [
+            torch.stack(
+                [
+                    zero
+                    if i == j
+                    else pair_losses[(min(i, j), max(i, j))]
+                    for j in range(count)
+                ]
+            )
+            for i in range(count)
+        ]
+    )
+    loss = torch.stack(list(pair_losses.values())).mean()
+    similarity = torch.einsum("nif,mjf->ijnm", hx, hx)
+    details = TensorDict(
+        {
+            "loss_vec": loss_vec,
+            "loss_matrix": loss_matrix,
+            "similarity": similarity,
+            "u": u,
+            "mask": mask,
+            "valid_counts": valid_counts,
+        },
+        batch_size=[],
+    )
+    return loss, details
+
+
+def test_vectorized_pairwise_flo_loss_matches_masked_reference() -> None:
+    model = make_pairwise_flo(count=4)
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 1],
+            [1, 1, 0, 1],
+            [1, 0, 1, 1],
+            [0, 1, 1, 1],
+            [1, 1, 1, 0],
+            [1, 0, 1, 0],
+        ],
+        dtype=torch.bool,
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(6, 4, 4),
+        x_mask=mask,
+        batch_size=[6],
+    )
+    predictions = model.compute_forward(batch)
+
+    actual_loss, actual_details = pairwise_flo_loss(predictions)
+    reference_loss, reference_details = pairwise_flo_loss_ref(predictions)
+
+    assert torch.allclose(actual_loss, reference_loss, atol=1e-6)
+    assert set(actual_details.keys()) == set(reference_details.keys())
+    for key in actual_details.keys():
+        actual = actual_details[key]
+        reference = reference_details[key]
+        if actual.dtype == torch.bool or not actual.is_floating_point():
+            assert torch.equal(actual, reference), key
+        else:
+            assert torch.allclose(actual, reference, atol=1e-6), key
 
 
 def test_pairwise_flo_shapes_symmetry_diagonal_and_gradients() -> None:
