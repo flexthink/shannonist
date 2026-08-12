@@ -916,7 +916,10 @@ class JointBA(
         self,
         predictions: JointBAOutput,
     ) -> ObjectiveOutput:
-        """Compute the negative Barber-Agakov lower bound.
+        """Compute the feature-normalized BA optimization objective.
+
+        Only the optimization loss is divided by ``enc_dim``. The reported
+        estimate and diagnostic BA loss remain in total nats.
 
         Parameters
         ----------
@@ -937,6 +940,7 @@ class JointBA(
         if entropy_objective is not None:
             loss = loss + entropy_objective.loss
             details["entropy_loss"] = entropy_objective.loss.detach()
+        loss = loss / self.enc_dim
         return ObjectiveOutput(
             loss=loss,
             estimate=-ba_loss,
@@ -1262,7 +1266,10 @@ class PairwiseBA(
         self,
         predictions: PairwiseBAOutput,
     ) -> ObjectiveOutput:
-        """Compute the mean BA objective over all unique pairs."""
+        """Compute the feature-normalized pairwise BA objective.
+
+        The estimate matrix and diagnostic losses remain in total nats.
+        """
         ba_loss, details = pairwise_ba_loss(predictions)
         entropy_objective = self.entropy_estimator.compute_objectives(
             predictions.entropy[predictions.mask]
@@ -1272,6 +1279,7 @@ class PairwiseBA(
         if entropy_objective is not None:
             loss = loss + entropy_objective.loss
             details["entropy_loss"] = entropy_objective.loss.detach()
+        loss = loss / self.enc_dim
         return ObjectiveOutput(
             loss=loss,
             estimate=details["estimate_matrix"],
@@ -1607,7 +1615,10 @@ class SampledPairwiseBA(
         self,
         predictions: SampledPairwiseBAOutput,
     ) -> ObjectiveOutput:
-        """Compute the BA objective over sampled variable pairs."""
+        """Compute the feature-normalized sampled BA objective.
+
+        The reported estimate and diagnostic BA loss remain in total nats.
+        """
         ba_loss, details = sampled_pairwise_ba_loss(predictions)
         entropy_objective = self.entropy_estimator.compute_objectives(
             predictions.entropy
@@ -1617,6 +1628,7 @@ class SampledPairwiseBA(
         if entropy_objective is not None:
             loss = loss + entropy_objective.loss
             details["entropy_loss"] = entropy_objective.loss.detach()
+        loss = loss / self.enc_dim
         return ObjectiveOutput(
             loss=loss,
             estimate=details["estimate_vec"].mean(),
@@ -1639,7 +1651,9 @@ class SampledPairwiseBA(
             Method-specific options. ``mode`` may be ``"sampled"`` (the
             default) or ``"full"``. Full mode returns a symmetric
             ``(batch, count, count)`` matrix with a zero diagonal and zeros
-            for pairs containing a masked position.
+            for pairs containing a masked position. ``chunk_size`` controls
+            the maximum number of positions evaluated along each pairwise
+            block dimension in full mode and defaults to 32.
 
         Returns
         -------
@@ -1654,13 +1668,24 @@ class SampledPairwiseBA(
         """
         options = dict(options or {})
         mode = options.pop("mode", "sampled")
+        chunk_size = options.pop("chunk_size", None)
         if options:
             unexpected = ", ".join(sorted(options))
             raise ValueError(f"unknown SampledPairwiseBA options: {unexpected}")
         if mode == "full":
-            return self._estimate_full(batch)
+            if chunk_size is None:
+                chunk_size = 32
+            if (
+                not isinstance(chunk_size, int)
+                or isinstance(chunk_size, bool)
+                or chunk_size <= 0
+            ):
+                raise ValueError("chunk_size must be a positive integer")
+            return self._estimate_full(batch, chunk_size)
         if mode != "sampled":
             raise ValueError("mode must be 'sampled' or 'full'")
+        if chunk_size is not None:
+            raise ValueError("chunk_size is only supported in full mode")
 
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
@@ -1670,8 +1695,13 @@ class SampledPairwiseBA(
             batch_size=[],
         )
 
-    def _estimate_full(self, batch: PairwiseMIBatch) -> MIEstimate:
-        """Evaluate every distinct variable pair for each observation."""
+    @torch.no_grad()
+    def _estimate_full(
+        self,
+        batch: PairwiseMIBatch,
+        chunk_size: int,
+    ) -> MIEstimate:
+        """Evaluate all pairs in blocks without materializing ``B*C*C*F``."""
         x = batch.x
         if x.ndim != 3:
             raise ValueError("full mode requires x with shape (batch, count, dim)")
@@ -1695,39 +1725,78 @@ class SampledPairwiseBA(
         if mask.any():
             entropy[mask] = self.entropy_estimator(hx[mask])
 
-        target = hx.unsqueeze(-2).expand(
-            batch_size,
-            count,
-            count,
-            self.enc_dim,
-        )
-        condition = hx.unsqueeze(-3).expand_as(target)
-        conditional_params = self.conditional_proposal(condition)
-        conditional_log_prob = self.conditional_proposal.log_prob(
-            target,
-            conditional_params,
-        )
-        pair_valid = mask.unsqueeze(-1) & mask.unsqueeze(-2)
-        if not torch.all(torch.isfinite(conditional_log_prob[pair_valid])):
-            raise ValueError("valid conditional log-probabilities must be finite")
+        estimate_matrix = hx.new_zeros(batch_size, count, count)
+        for left_start in range(0, count, chunk_size):
+            left_stop = min(left_start + chunk_size, count)
+            left = hx[:, left_start:left_stop]
+            left_entropy = entropy[:, left_start:left_stop]
+            left_mask = mask[:, left_start:left_stop]
+            for right_start in range(left_start, count, chunk_size):
+                right_stop = min(right_start + chunk_size, count)
+                right = hx[:, right_start:right_stop]
+                right_entropy = entropy[:, right_start:right_stop]
+                right_mask = mask[:, right_start:right_stop]
+                block_valid = left_mask.unsqueeze(-1) & right_mask.unsqueeze(-2)
+                if not block_valid.any():
+                    continue
 
-        directed_estimate = entropy.unsqueeze(-1) + conditional_log_prob
-        estimate_matrix = (
-            directed_estimate + directed_estimate.transpose(-1, -2)
-        ) / 2
-        diagonal = torch.eye(
-            count,
-            dtype=torch.bool,
-            device=x.device,
-        ).unsqueeze(0)
-        estimate_matrix = estimate_matrix.masked_fill(~pair_valid, 0)
-        estimate_matrix = estimate_matrix.masked_fill(diagonal, 0)
+                left_count = left.shape[1]
+                right_count = right.shape[1]
+                left_values = left.unsqueeze(-2).expand(
+                    batch_size,
+                    left_count,
+                    right_count,
+                    self.enc_dim,
+                )
+                right_values = right.unsqueeze(-3).expand_as(left_values)
+
+                left_params = self.conditional_proposal(right_values)
+                left_log_prob = self.conditional_proposal.log_prob(
+                    left_values,
+                    left_params,
+                )
+                del left_params
+                right_params = self.conditional_proposal(left_values)
+                right_log_prob = self.conditional_proposal.log_prob(
+                    right_values,
+                    right_params,
+                )
+                del right_params
+                if not torch.all(torch.isfinite(left_log_prob[block_valid])):
+                    raise ValueError(
+                        "valid conditional log-probabilities must be finite"
+                    )
+                if not torch.all(torch.isfinite(right_log_prob[block_valid])):
+                    raise ValueError(
+                        "valid conditional log-probabilities must be finite"
+                    )
+
+                block = (
+                    left_entropy.unsqueeze(-1)
+                    + left_log_prob
+                    + right_entropy.unsqueeze(-2)
+                    + right_log_prob
+                ) / 2
+                block = block.masked_fill(~block_valid, 0)
+                if left_start == right_start:
+                    block = (block + block.transpose(-1, -2)) / 2
+                    block.diagonal(dim1=-2, dim2=-1).zero_()
+                estimate_matrix[
+                    :,
+                    left_start:left_stop,
+                    right_start:right_stop,
+                ] = block
+                if left_start != right_start:
+                    estimate_matrix[
+                        :,
+                        right_start:right_stop,
+                        left_start:left_stop,
+                    ] = block.transpose(-1, -2)
+
         details = TensorDict(
             {
                 "estimate_matrix": estimate_matrix,
-                "directed_estimate": directed_estimate,
                 "entropy_vec": entropy,
-                "conditional_log_prob": conditional_log_prob,
                 "mask": mask,
             },
             batch_size=[batch_size],

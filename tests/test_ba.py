@@ -57,6 +57,18 @@ class ConstantDensityProposal(Proposal):
         return params["density"].log()
 
 
+class RecordingDensityProposal(ConstantDensityProposal):
+    """Constant proposal recording the pair-block shapes it receives."""
+
+    def __init__(self, dim: int, density: float) -> None:
+        super().__init__(dim, density)
+        self.condition_shapes: list[torch.Size] = []
+
+    def forward(self, condition: torch.Tensor) -> TensorDict:
+        self.condition_shapes.append(condition.shape)
+        return super().forward(condition)
+
+
 class ConstantEntropyEstimator(EntropyEstimator):
     """Entropy estimator returning one learned constant."""
 
@@ -527,19 +539,19 @@ def test_joint_ba_bound_combines_entropy_and_conditional_density() -> None:
 def test_joint_ba_adds_optional_entropy_objective() -> None:
     entropy = torch.log(torch.tensor(4.0))
     entropy_estimator = TrainableConstantEntropyEstimator(
-        dim=1,
+        dim=4,
         entropy=entropy.item(),
     )
     estimator = JointBA(
-        dim=1,
-        enc_dim=1,
+        dim=4,
+        enc_dim=4,
         encoder=nn.Identity(),
-        conditional_proposal=ConstantDensityProposal(1, density=0.5),
+        conditional_proposal=ConstantDensityProposal(4, density=0.5),
         entropy_estimator=entropy_estimator,
     )
     batch = MIBatch(
-        x=torch.randn(4, 1),
-        y=torch.randn(4, 1),
+        x=torch.randn(4, 4),
+        y=torch.randn(4, 4),
         batch_size=[4],
     )
 
@@ -551,7 +563,10 @@ def test_joint_ba_adds_optional_entropy_objective() -> None:
     assert torch.allclose(estimate.value, expected_estimate)
     assert torch.allclose(objective.metrics["ba_loss"], -expected_estimate)
     assert torch.allclose(objective.metrics["entropy_loss"], entropy)
-    assert torch.allclose(objective.loss, entropy - expected_estimate)
+    assert torch.allclose(
+        objective.loss,
+        (entropy - expected_estimate) / estimator.enc_dim,
+    )
     assert torch.allclose(objective.estimate, expected_estimate)
 
 
@@ -734,7 +749,8 @@ def test_pairwise_ba_returns_symmetric_matrix_and_zero_diagonal() -> None:
     assert predictions.mask.shape == (8, 3)
     assert torch.allclose(objective.estimate, expected)
     assert torch.allclose(estimate.value, expected)
-    assert torch.allclose(objective.loss, -expected.triu(1).sum() / 3)
+    raw_loss = -expected.triu(1).sum() / 3
+    assert torch.allclose(objective.loss, raw_loss / estimator.enc_dim)
 
 
 def test_pairwise_ba_loss_averages_both_directions() -> None:
@@ -893,6 +909,8 @@ def test_sampled_pairwise_ba_samples_only_valid_pairs() -> None:
     expected = torch.log(torch.tensor(2.0))
     assert torch.allclose(objective.estimate, expected)
     assert torch.allclose(objective.metrics["estimate_vec"], expected)
+    assert torch.allclose(objective.metrics["ba_loss"], -expected)
+    assert torch.allclose(objective.loss, -expected / estimator.enc_dim)
 
 
 def test_sampled_pairwise_ba_loss_averages_directions_and_samples() -> None:
@@ -1028,3 +1046,58 @@ def test_sampled_pairwise_ba_full_mode_requires_three_dimensions() -> None:
 
     with pytest.raises(ValueError, match=r"\(batch, count, dim\)"):
         estimator.estimate(batch, {"mode": "full"})
+
+
+def test_sampled_pairwise_ba_full_mode_chunks_pairwise_features() -> None:
+    proposal = RecordingDensityProposal(dim=2, density=0.5)
+    estimator = SampledPairwiseBA(
+        dim=2,
+        enc_dim=2,
+        sample_size=2,
+        encoder=nn.Identity(),
+        conditional_proposal=proposal,
+        entropy_estimator=ConstantEntropyEstimator(
+            2,
+            entropy=torch.log(torch.tensor(4.0)).item(),
+        ),
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(2, 7, 2),
+        batch_size=[2],
+    )
+
+    chunked = estimator.estimate(
+        batch,
+        {"mode": "full", "chunk_size": 3},
+    )
+    unchunked = estimator.estimate(
+        batch,
+        {"mode": "full", "chunk_size": 7},
+    )
+
+    assert torch.equal(chunked.value, unchunked.value)
+    chunked_shapes = proposal.condition_shapes[:-2]
+    assert len(chunked_shapes) > 2
+    assert all(shape[-3] <= 3 for shape in chunked_shapes)
+    assert all(shape[-2] <= 3 for shape in chunked_shapes)
+    assert all(shape[-1] == 2 for shape in chunked_shapes)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+def test_sampled_pairwise_ba_full_mode_validates_chunk_size(
+    chunk_size: object,
+) -> None:
+    estimator = make_sampled_pairwise_ba(sample_size=2)
+    batch = PairwiseMIBatch(
+        x=torch.randn(2, 4, 2),
+        batch_size=[2],
+    )
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        estimator.estimate(
+            batch,
+            {"mode": "full", "chunk_size": chunk_size},
+        )
+
+    with pytest.raises(ValueError, match="only supported in full mode"):
+        estimator.estimate(batch, {"chunk_size": 2})
