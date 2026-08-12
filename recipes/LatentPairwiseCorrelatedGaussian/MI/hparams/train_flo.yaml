@@ -28,7 +28,7 @@ sample_size: 5
 feature_dim: 64
 encoder_hidden_dims: [128, 128]
 
-train_set: !new:shannonist.mi.LatentPairwiseCorrelatentGaussian
+train_set: !new:shannonist.mi.LatentPairwiseCorrelatedGaussian
     count: !ref <latent_count>
     batch_size: !ref <batch_size>
     mutual_information: !ref <mutual_information>
@@ -36,7 +36,7 @@ train_set: !new:shannonist.mi.LatentPairwiseCorrelatentGaussian
     num_batches: !ref <train_batches>
     context_fraction: 0.5
 
-valid_set: !new:shannonist.mi.LatentPairwiseCorrelatentGaussian
+valid_set: !new:shannonist.mi.LatentPairwiseCorrelatedGaussian
     count: !ref <latent_count>
     batch_size: !ref <batch_size>
     mutual_information: !ref <mutual_information>

@@ -13,8 +13,8 @@ from shannonist.models.critic import (
 from shannonist.models.mlp import MLP, MultiMLP
 
 
-class BilinearFLOOutput(TensorClass):
-    """Predictions and auxiliary outputs produced by bilinear FLO.
+class JointFLOOutput(TensorClass):
+    """Predictions and auxiliary outputs produced by joint FLO.
 
     Parameters
     ----------
@@ -25,7 +25,7 @@ class BilinearFLOOutput(TensorClass):
     critic: BilinearCriticOutput
 
 
-def flo_loss(predictions: BilinearFLOOutput) -> tuple[Tensor, TensorDict]:
+def flo_loss(predictions: JointFLOOutput) -> tuple[Tensor, TensorDict]:
     """Compute the contrastive Fenchel-Legendre optimization loss.
 
     Positive pairs occupy matching positions in the two critic
@@ -33,7 +33,7 @@ def flo_loss(predictions: BilinearFLOOutput) -> tuple[Tensor, TensorDict]:
 
     Parameters
     ----------
-    predictions : BilinearFLOOutput
+    predictions : JointFLOOutput
         Precomputed critic representations and potential values.
 
     Returns
@@ -89,11 +89,11 @@ def flo_loss(predictions: BilinearFLOOutput) -> tuple[Tensor, TensorDict]:
     return loss, details
 
 
-class BilinearFLO(
+class JointFLO(
     nn.Module,
-    TrainableEstimator[MIBatch, BilinearFLOOutput, MIEstimate],
+    TrainableEstimator[MIBatch, JointFLOOutput, MIEstimate],
 ):
-    """Bilinear FLO mutual-information estimator.
+    """Joint FLO mutual-information estimator.
 
     The estimator constructs its own :class:`BilinearCritic` from the supplied
     encoders and potential. Model execution and objective computation are kept
@@ -130,7 +130,7 @@ class BilinearFLO(
             use_norm=use_norm,
         )
 
-    def compute_forward(self, batch: MIBatch) -> BilinearFLOOutput:
+    def compute_forward(self, batch: MIBatch) -> JointFLOOutput:
         """Compute critic predictions for a paired batch.
 
         Parameters
@@ -140,7 +140,7 @@ class BilinearFLO(
 
         Returns
         -------
-        BilinearFLOOutput
+        JointFLOOutput
             Critic representations and potential values used by FLO.
 
         Raises
@@ -150,20 +150,20 @@ class BilinearFLO(
         """
         self._validate_masks(batch)
         critic_output = self.critic(batch.x, batch.y)
-        return BilinearFLOOutput(
+        return JointFLOOutput(
             critic=critic_output,
             batch_size=critic_output.batch_size,
         )
 
     def compute_objectives(
         self,
-        predictions: BilinearFLOOutput,
+        predictions: JointFLOOutput,
     ) -> ObjectiveOutput:
         """Compute the differentiable FLO objective from predictions.
 
         Parameters
         ----------
-        predictions : BilinearFLOOutput
+        predictions : JointFLOOutput
             Output previously returned by :meth:`compute_forward`.
 
         Returns
@@ -172,14 +172,19 @@ class BilinearFLO(
             Scalar FLO loss and diagnostic tensors.
         """
         loss, details = flo_loss(predictions)
-        return ObjectiveOutput(loss=loss, metrics=details, batch_size=[])
+        return ObjectiveOutput(
+            loss=loss,
+            estimate=-loss,
+            metrics=details,
+            batch_size=[],
+        )
 
-    def MI(self, predictions: BilinearFLOOutput) -> tuple[Tensor, TensorDict]:
+    def MI(self, predictions: JointFLOOutput) -> tuple[Tensor, TensorDict]:
         """Estimate mutual information from precomputed predictions.
 
         Parameters
         ----------
-        predictions : BilinearFLOOutput
+        predictions : JointFLOOutput
             Output previously returned by :meth:`compute_forward`.
 
         Returns
@@ -190,7 +195,7 @@ class BilinearFLO(
         objective = self.compute_objectives(predictions)
         details = objective.metrics
         assert details is not None
-        return -objective.loss, details
+        return objective.estimate, details
 
     def estimate(self, batch: MIBatch) -> MIEstimate:
         """Estimate mutual information for a batch.
@@ -213,7 +218,7 @@ class BilinearFLO(
     def _validate_masks(batch: MIBatch) -> None:
         """Reject masks until masked FLO estimation is implemented."""
         if batch.x_mask is not None or batch.y_mask is not None:
-            raise NotImplementedError("BilinearFLO does not yet support masks")
+            raise NotImplementedError("JointFLO does not yet support masks")
 
 
 class PairwiseFLOOutput(TensorClass):
@@ -458,7 +463,12 @@ class PairwiseFLO(
             Scalar joint loss and pairwise diagnostics.
         """
         loss, details = pairwise_flo_loss(predictions)
-        return ObjectiveOutput(loss=loss, metrics=details, batch_size=[])
+        return ObjectiveOutput(
+            loss=loss,
+            estimate=-details["loss_matrix"],
+            metrics=details,
+            batch_size=[],
+        )
 
     def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
         """Estimate a symmetric pairwise mutual-information matrix.
@@ -478,7 +488,7 @@ class PairwiseFLO(
         details = objective.metrics
         assert details is not None
         return MIEstimate(
-            value=-details["loss_matrix"],
+            value=objective.estimate,
             details=details,
             batch_size=[],
         )
@@ -581,6 +591,8 @@ def contrastive_pairwise_flo_loss(
         {
             "loss_vec": loss_vec,
             "loss_by_pair": loss_by_pair,
+            "estimate_vec": -loss_vec,
+            "estimate_by_pair": -loss_by_pair,
             "similarity": similarity,
             "u": u,
             "position_indices": position_indices,
@@ -783,7 +795,12 @@ class ContrastivePairwiseFLO(
             Scalar FLO loss and pair-level diagnostics.
         """
         loss, details = contrastive_pairwise_flo_loss(predictions)
-        return ObjectiveOutput(loss=loss, metrics=details, batch_size=[])
+        return ObjectiveOutput(
+            loss=loss,
+            estimate=-loss,
+            metrics=details,
+            batch_size=[],
+        )
 
     def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
         """Estimate mean MI across newly sampled sequence-position pairs.
@@ -801,7 +818,7 @@ class ContrastivePairwiseFLO(
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
         return MIEstimate(
-            value=-objective.loss,
+            value=objective.estimate,
             details=objective.metrics,
             batch_size=[],
         )
@@ -812,8 +829,8 @@ ContrastivePairwiseFLow = ContrastivePairwiseFLO
 
 
 __all__ = [
-    "BilinearFLO",
-    "BilinearFLOOutput",
+    "JointFLO",
+    "JointFLOOutput",
     "ContrastivePairwiseFLO",
     "ContrastivePairwiseFLow",
     "ContrastivePairwiseFLOOutput",

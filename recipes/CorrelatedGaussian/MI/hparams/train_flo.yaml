@@ -40,7 +40,7 @@ potential: !new:shannonist.models.BilinearPotential
     input_dim: !ref <feature_dim>
     hidden_dim: !ref <potential_hidden_dims>
 
-estimator: !new:shannonist.mi.BilinearFLO
+estimator: !new:shannonist.mi.JointFLO
     encoder_x: !ref <encoder_x>
     encoder_y: !ref <encoder_y>
     potential: !ref <potential>

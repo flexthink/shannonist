@@ -11,17 +11,21 @@ EstimateT = TypeVar("EstimateT", bound=TensorClass)
 
 
 class ObjectiveOutput(TensorClass):
-    """Output of a differentiable estimator objective.
+    """Differentiable objective and its corresponding estimate.
 
     Parameters
     ----------
     loss : Tensor
         Scalar loss to minimize.
+    estimate : Tensor
+        Estimated quantity reported independently of the optimization loss.
+        Its shape is estimator-specific.
     metrics : TensorDict, optional
         Detached or diagnostic values associated with the objective.
     """
 
     loss: Tensor
+    estimate: Tensor
     metrics: TensorDict | None = None
 
 
@@ -82,7 +86,8 @@ class TrainableEstimator(
         Returns
         -------
         ObjectiveOutput
-            Loss and optional metrics for external optimization.
+            Optimization loss, independently reported estimate, and optional
+            metrics.
         """
         ...
 

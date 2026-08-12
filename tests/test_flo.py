@@ -4,7 +4,7 @@ from tensordict import TensorDict
 from torch import nn
 
 from shannonist.mi import (
-    BilinearFLO,
+    JointFLO,
     ContrastivePairwiseFLO,
     ContrastivePairwiseFLOOutput,
     MIBatch,
@@ -30,22 +30,22 @@ class CountingIdentity(nn.Module):
         return x
 
 
-def make_bilinear_flo(
+def make_joint_flo(
     input_dim: int = 3,
     feature_dim: int = 4,
-) -> BilinearFLO:
+) -> JointFLO:
     """Construct a small bilinear estimator for tests."""
-    return BilinearFLO(
+    return JointFLO(
         MLP(input_dim, output_dim=feature_dim, hidden_dim=(6,)),
         MLP(input_dim, output_dim=feature_dim, hidden_dim=(6,)),
         BilinearPotential(feature_dim, hidden_dim=(5,)),
     )
 
 
-def test_bilinear_flo_forward_and_objective_are_separate() -> None:
+def test_joint_flo_forward_and_objective_are_separate() -> None:
     encoder_x = CountingIdentity()
     encoder_y = CountingIdentity()
-    model = BilinearFLO(
+    model = JointFLO(
         encoder_x,
         encoder_y,
         BilinearPotential(3, hidden_dim=(4,)),
@@ -62,6 +62,7 @@ def test_bilinear_flo_forward_and_objective_are_separate() -> None:
     objective = model.compute_objectives(predictions)
     assert encoder_x.calls == encoder_y.calls == 1
     assert objective.loss.requires_grad
+    assert torch.allclose(objective.estimate, -objective.loss)
     assert objective.metrics["similarity"].shape == (5, 5)
 
     objective.loss.backward()
@@ -69,7 +70,7 @@ def test_bilinear_flo_forward_and_objective_are_separate() -> None:
 
 
 def test_flo_loss_matches_explicit_formula() -> None:
-    model = make_bilinear_flo()
+    model = make_joint_flo()
     batch = MIBatch(
         x=torch.randn(6, 3),
         y=torch.randn(6, 3),
@@ -95,8 +96,8 @@ def test_flo_loss_matches_explicit_formula() -> None:
     assert torch.allclose(details["loss_vec"], expected_vec)
 
 
-def test_bilinear_flo_estimate_is_negative_objective() -> None:
-    model = make_bilinear_flo()
+def test_joint_flo_estimate_is_negative_objective() -> None:
+    model = make_joint_flo()
     batch = MIBatch(
         x=torch.randn(7, 3),
         y=torch.randn(7, 3),
@@ -107,11 +108,12 @@ def test_bilinear_flo_estimate_is_negative_objective() -> None:
     estimate = model.estimate(batch)
 
     assert torch.allclose(estimate.value, -objective.loss)
+    assert torch.allclose(estimate.value, objective.estimate)
     assert estimate.details["similarity"].shape == (7, 7)
 
 
-def test_bilinear_flo_rejects_masks_and_single_sample() -> None:
-    model = make_bilinear_flo()
+def test_joint_flo_rejects_masks_and_single_sample() -> None:
+    model = make_joint_flo()
     masked = MIBatch(
         x=torch.randn(4, 3),
         y=torch.randn(4, 3),

@@ -259,7 +259,7 @@ class PairwiseCorrelatedGaussian(Dataset[TensorDict]):
         return TensorDict({"x": self.factor @ latent}, batch_size=[])
 
 
-class LatentPairwiseCorrelatentGaussian(Dataset[TensorDict]):
+class LatentPairwiseCorrelatedGaussian(Dataset[TensorDict]):
     r"""Batched pairwise Gaussian data with covariance-preserving contexts.
 
     Every item creates ``count`` independent standard-Gaussian context vectors
@@ -447,14 +447,9 @@ class LatentPairwiseCorrelatentGaussian(Dataset[TensorDict]):
         return float(denominator.reciprocal().item())
 
 
-# Correctly spelled convenience alias for the originally requested API name.
-LatentPairwiseCorrelatedGaussian = LatentPairwiseCorrelatentGaussian
-
-
 __all__ = [
     "CorrelatedGausian",
     "LatentPairwiseCorrelatedGaussian",
-    "LatentPairwiseCorrelatentGaussian",
     "PairwiseCorrelatedGaussian",
     "tensordict_collate",
     "tensordict_passthrough",

@@ -1,4 +1,4 @@
-"""Train contrastive pairwise FLO on latent-conditioned sequences."""
+"""Train a sampled pairwise MI estimator on latent-conditioned tensors."""
 
 from collections.abc import Sequence
 
@@ -12,13 +12,19 @@ from shannonist.mi import (
     ContrastivePairwiseFLO,
     ContrastivePairwiseFLOOutput,
     PairwiseMIBatch,
+    SampledPairwiseBA,
+    SampledPairwiseBAOutput,
 )
 
 
-class ContrastivePairwiseFLOBrain(
-    Brain[TensorDict, ContrastivePairwiseFLOOutput]
-):
-    """SpeechBrain-style loop for latent-conditioned contrastive FLO."""
+SampledPairwisePrediction = (
+    ContrastivePairwiseFLOOutput | SampledPairwiseBAOutput
+)
+SampledPairwiseEstimator = ContrastivePairwiseFLO | SampledPairwiseBA
+
+
+class SampledPairwiseMIBrain(Brain[TensorDict, SampledPairwisePrediction]):
+    """Training loop for latent-conditioned sampled pairwise MI."""
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
@@ -31,7 +37,7 @@ class ContrastivePairwiseFLOBrain(
         self,
         batch: TensorDict,
         stage: Stage,
-    ) -> ContrastivePairwiseFLOOutput:
+    ) -> SampledPairwisePrediction:
         """Run the estimator on one dataset-generated batch.
 
         Parameters
@@ -44,8 +50,8 @@ class ContrastivePairwiseFLOBrain(
 
         Returns
         -------
-        ContrastivePairwiseFLOOutput
-            Encoded sampled pairs and their critic potentials.
+        SampledPairwisePrediction
+            Estimator-specific predictions for sampled variable pairs.
         """
         del stage
         mi_batch = PairwiseMIBatch(
@@ -56,15 +62,15 @@ class ContrastivePairwiseFLOBrain(
 
     def compute_objectives(
         self,
-        predictions: ContrastivePairwiseFLOOutput,
+        predictions: SampledPairwisePrediction,
         batch: TensorDict,
         stage: Stage,
     ) -> Tensor:
-        """Compute FLO and retain learned and ground-truth MI.
+        """Compute the objective and retain learned and ground-truth MI.
 
         Parameters
         ----------
-        predictions : ContrastivePairwiseFLOOutput
+        predictions : SampledPairwisePrediction
             Output produced by :meth:`compute_forward`.
         batch : TensorDict
             Dataset-generated batch. It is unused because all required model
@@ -75,20 +81,21 @@ class ContrastivePairwiseFLOBrain(
         Returns
         -------
         Tensor
-            Mean contrastive FLO loss.
+            Mean estimator loss.
         """
         del batch, stage
         objective = self._estimator().compute_objectives(predictions)
         metrics = objective.metrics
         assert metrics is not None
-        pair_estimates = -metrics["loss_by_pair"].detach().cpu()
-        self._stage_estimates.append(pair_estimates.mean())
+        pair_estimates = metrics["estimate_vec"].detach().cpu()
+        self._stage_estimates.append(objective.estimate.detach().cpu())
 
-        # Position pairs are shared across the batch by the estimator. Record
-        # both directions so the reported validation matrix is symmetric.
-        pair_indices = predictions.position_indices[0].detach().cpu()
-        left = pair_indices[:, 0]
-        right = pair_indices[:, 1]
+        # Record each sampled observation separately because masked inputs may
+        # map shared valid-position ordinals to different absolute indices.
+        pair_indices = predictions.position_indices.detach().cpu()
+        left = pair_indices[..., 0].reshape(-1)
+        right = pair_indices[..., 1].reshape(-1)
+        pair_estimates = pair_estimates.reshape(-1)
         ones = torch.ones_like(pair_estimates)
         self._stage_matrix_sum.index_put_(
             (left, right), pair_estimates, accumulate=True
@@ -147,12 +154,16 @@ class ContrastivePairwiseFLOBrain(
                     f"{_format_matrix_row(truth_row)}"
                 )
 
-    def _estimator(self) -> ContrastivePairwiseFLO:
+    def _estimator(self) -> SampledPairwiseEstimator:
         """Return the configured estimator with a checked type."""
         estimator = self.modules["estimator"]
-        if not isinstance(estimator, ContrastivePairwiseFLO):
+        if not isinstance(
+            estimator,
+            (ContrastivePairwiseFLO, SampledPairwiseBA),
+        ):
             raise TypeError(
-                "the estimator module must be a ContrastivePairwiseFLO"
+                "the estimator module must be a ContrastivePairwiseFLO "
+                "or SampledPairwiseBA"
             )
         return estimator
 
@@ -163,7 +174,7 @@ def _format_matrix_row(row: Tensor) -> str:
 
 
 def main(arg_list: Sequence[str] | None = None) -> None:
-    """Load hyperparameters and train contrastive pairwise FLO.
+    """Load hyperparameters and train sampled pairwise MI.
 
     Parameters
     ----------
@@ -175,7 +186,7 @@ def main(arg_list: Sequence[str] | None = None) -> None:
         hparams = load_hyperpyyaml(yaml_file, overrides)
 
     torch.manual_seed(hparams["seed"])
-    brain = ContrastivePairwiseFLOBrain(
+    brain = SampledPairwiseMIBrain(
         modules={"estimator": hparams["estimator"]},
         opt_class=hparams["optimizer"],
         hparams=hparams,

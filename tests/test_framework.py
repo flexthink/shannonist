@@ -26,7 +26,8 @@ class ConcreteEstimator(TrainableEstimator[Input, Prediction, Estimate]):
         return Prediction(value=batch.value * 2, batch_size=batch.batch_size)
 
     def compute_objectives(self, predictions: Prediction) -> ObjectiveOutput:
-        return ObjectiveOutput(loss=predictions.value.mean(), batch_size=[])
+        mean = predictions.value.mean()
+        return ObjectiveOutput(loss=mean, estimate=mean, batch_size=[])
 
     def estimate(self, batch: Input) -> Estimate:
         predictions = self.compute_forward(batch)
@@ -50,4 +51,5 @@ def test_trainable_estimator_separates_forward_and_objective() -> None:
 
     assert torch.equal(predictions.value, batch.value * 2)
     assert objective.loss.item() == pytest.approx(3.0)
+    assert objective.estimate.item() == pytest.approx(3.0)
     assert estimate.value.item() == pytest.approx(3.0)

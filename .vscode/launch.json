@@ -1,0 +1,153 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "FLO: Correlated Gaussian",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/CorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/CorrelatedGaussian/MI/hparams/train_flo.yaml",
+                "--mutual_information", "0.5",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "BA: Correlated Gaussian",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/CorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/CorrelatedGaussian/MI/hparams/train_ba.yaml",
+                "--mutual_information", "0.5",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "BA Flow: Correlated Gaussian",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/CorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/CorrelatedGaussian/MI/hparams/train_ba.yaml",
+                "--conditional_proposal", "flow",
+                "--entropy_estimator", "flow",
+                "--mutual_information", "0.5",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "PairwiseFLO: Correlated Gaussian",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/PairwiseCorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/PairwiseCorrelatedGaussian/MI/hparams/train_flo.yaml",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005",
+                "--device", "mps"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "PairwiseBA: Correlated Gaussian",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/PairwiseCorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/PairwiseCorrelatedGaussian/MI/hparams/train_ba.yaml",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005",
+                "--device", "mps"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "ContrastivePairwiseFLO: Latent Correlated Gaussian",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/LatentPairwiseCorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/LatentPairwiseCorrelatedGaussian/MI/hparams/train_flo.yaml",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005",
+                "--device", "mps"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "SampledPairwiseBA: Latent Correlated Gaussian",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/LatentPairwiseCorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/LatentPairwiseCorrelatedGaussian/MI/hparams/train_ba.yaml",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005",
+                "--device", "mps"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "SampledPairwiseBA: Latent Correlated Gaussian Flow",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/recipes/LatentPairwiseCorrelatedGaussian/MI/train.py",
+            "args": [
+                "${workspaceFolder}/recipes/LatentPairwiseCorrelatedGaussian/MI/hparams/train_ba.yaml",
+                "--number_of_epochs", "100",
+                "--lr", "0.0005",
+                "--conditional_proposal", "flow",
+                "--entropy_estimator", "flow",
+                "--device", "mps"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }        
+    ]
+}

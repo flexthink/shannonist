@@ -1,4 +1,4 @@
-"""Train pairwise FLO on correlated Gaussian observations."""
+"""Train a pairwise MI estimator on correlated Gaussian observations."""
 
 from collections.abc import Sequence
 
@@ -8,11 +8,21 @@ from tensordict import TensorDict
 from torch import Tensor
 
 from shannonist.core import Brain, RunOpts, Stage, parse_arguments
-from shannonist.mi import PairwiseFLO, PairwiseFLOOutput, PairwiseMIBatch
+from shannonist.mi import (
+    PairwiseBA,
+    PairwiseBAOutput,
+    PairwiseFLO,
+    PairwiseFLOOutput,
+    PairwiseMIBatch,
+)
 
 
-class PairwiseFLOBrain(Brain[TensorDict, PairwiseFLOOutput]):
-    """SpeechBrain-style training loop for pairwise FLO."""
+PairwiseMIPrediction = PairwiseFLOOutput | PairwiseBAOutput
+PairwiseMIEstimator = PairwiseFLO | PairwiseBA
+
+
+class PairwiseMIBrain(Brain[TensorDict, PairwiseMIPrediction]):
+    """SpeechBrain-style training loop for pairwise MI estimation."""
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
@@ -22,7 +32,7 @@ class PairwiseFLOBrain(Brain[TensorDict, PairwiseFLOOutput]):
         self,
         batch: TensorDict,
         stage: Stage,
-    ) -> PairwiseFLOOutput:
+    ) -> PairwiseMIPrediction:
         """Construct a pairwise MI batch and run the estimator.
 
         Parameters
@@ -35,8 +45,8 @@ class PairwiseFLOBrain(Brain[TensorDict, PairwiseFLOOutput]):
 
         Returns
         -------
-        PairwiseFLOOutput
-            Encoded representations and pairwise potentials.
+        PairwiseMIPrediction
+            Estimator-specific predictions and auxiliary outputs.
         """
         del stage
         mi_batch = PairwiseMIBatch(
@@ -48,7 +58,7 @@ class PairwiseFLOBrain(Brain[TensorDict, PairwiseFLOOutput]):
 
     def compute_objectives(
         self,
-        predictions: PairwiseFLOOutput,
+        predictions: PairwiseMIPrediction,
         batch: TensorDict,
         stage: Stage,
     ) -> Tensor:
@@ -56,7 +66,7 @@ class PairwiseFLOBrain(Brain[TensorDict, PairwiseFLOOutput]):
 
         Parameters
         ----------
-        predictions : PairwiseFLOOutput
+        predictions : PairwiseMIPrediction
             Output produced by :meth:`compute_forward`.
         batch : TensorDict
             Input batch. It is unused because the required tensors are in
@@ -67,13 +77,11 @@ class PairwiseFLOBrain(Brain[TensorDict, PairwiseFLOOutput]):
         Returns
         -------
         Tensor
-            Mean FLO loss over unique pairs.
+            Mean estimator loss over unique pairs.
         """
         del batch, stage
         objective = self._estimator().compute_objectives(predictions)
-        metrics = objective.metrics
-        assert metrics is not None
-        self._stage_estimates.append((-metrics["loss_matrix"]).detach().cpu())
+        self._stage_estimates.append(objective.estimate.detach().cpu())
         return objective.loss
 
     def on_stage_start(self, stage: Stage, epoch: int | None) -> None:
@@ -101,11 +109,13 @@ class PairwiseFLOBrain(Brain[TensorDict, PairwiseFLOOutput]):
             truth_text = _format_matrix_row(truth_row)
             print(f"{learned_text} | {truth_text}")
 
-    def _estimator(self) -> PairwiseFLO:
+    def _estimator(self) -> PairwiseMIEstimator:
         """Return the configured estimator with a checked type."""
         estimator = self.modules["estimator"]
-        if not isinstance(estimator, PairwiseFLO):
-            raise TypeError("the estimator module must be a PairwiseFLO")
+        if not isinstance(estimator, (PairwiseFLO, PairwiseBA)):
+            raise TypeError(
+                "the estimator module must be a PairwiseFLO or PairwiseBA"
+            )
         return estimator
 
 
@@ -115,7 +125,7 @@ def _format_matrix_row(row: Tensor) -> str:
 
 
 def main(arg_list: Sequence[str] | None = None) -> None:
-    """Load recipe hyperparameters and run pairwise FLO training.
+    """Load recipe hyperparameters and run pairwise MI training.
 
     Parameters
     ----------
@@ -127,7 +137,7 @@ def main(arg_list: Sequence[str] | None = None) -> None:
         hparams = load_hyperpyyaml(yaml_file, overrides)
 
     torch.manual_seed(hparams["seed"])
-    brain = PairwiseFLOBrain(
+    brain = PairwiseMIBrain(
         modules={"estimator": hparams["estimator"]},
         opt_class=hparams["optimizer"],
         hparams=hparams,

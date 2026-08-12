@@ -5,7 +5,7 @@ information-theoretic properties of machine-learning models. Its estimators
 are designed to be composable: they expose model predictions and objectives,
 but do not own the optimizer or training loop.
 
-The first implemented estimator is bilinear FLO (contrastive
+The first implemented estimator is joint FLO (contrastive
 Fenchel-Legendre optimization) for mutual information.
 
 ## Installation
@@ -28,13 +28,13 @@ potential from their concatenated representations.
 ```python
 import torch
 
-from shannonist.mi import BilinearFLO, MIBatch
+from shannonist.mi import JointFLO, MIBatch
 from shannonist.models import BilinearPotential, MLP
 
 input_dim = 20
 feature_dim = 64
 
-estimator = BilinearFLO(
+estimator = JointFLO(
     encoder_x=MLP(input_dim, output_dim=feature_dim),
     encoder_y=MLP(input_dim, output_dim=feature_dim),
     potential=BilinearPotential(
@@ -59,7 +59,7 @@ objective.loss.backward()
 optimizer.step()
 ```
 
-`compute_forward()` executes the critic and returns a `BilinearFLOOutput`
+`compute_forward()` executes the critic and returns a `JointFLOOutput`
 TensorClass containing the critic representations and potential values.
 `compute_objectives()` consumes those predictions without running the model a
 second time. The returned `ObjectiveOutput` contains:
@@ -157,19 +157,26 @@ rejected with `ValueError`.
 ## Run the included recipe
 
 The correlated-Gaussian recipe provides a complete SpeechBrain-style training
-loop without depending on SpeechBrain:
+loop without depending on SpeechBrain. Run its FLO configuration with:
 
 ```bash
-python recipes/CorrelatedGaussian/FLO/train.py \
-  recipes/CorrelatedGaussian/FLO/hparams/train.yaml
+python recipes/CorrelatedGaussian/MI/train.py \
+  recipes/CorrelatedGaussian/MI/hparams/train_flo.yaml
+```
+
+The same script runs the Barber-Agakov estimator with:
+
+```bash
+python recipes/CorrelatedGaussian/MI/train.py \
+  recipes/CorrelatedGaussian/MI/hparams/train_ba.yaml
 ```
 
 The recipe is configured with HyperPyYAML. Override configuration values from
 the command line:
 
 ```bash
-python recipes/CorrelatedGaussian/FLO/train.py \
-  recipes/CorrelatedGaussian/FLO/hparams/train.yaml \
+python recipes/CorrelatedGaussian/MI/train.py \
+  recipes/CorrelatedGaussian/MI/hparams/train_flo.yaml \
   --device cuda:0 \
   --mutual_information=1.0 \
   --number_of_epochs=5
@@ -182,8 +189,8 @@ The pairwise recipe trains `PairwiseFLO` from a user-supplied MI matrix and
 prints its learned lower bounds beside the ground truth:
 
 ```bash
-python recipes/PairwiseCorrelatedGaussian/FLO/train.py \
-  recipes/PairwiseCorrelatedGaussian/FLO/hparams/train.yaml
+python recipes/PairwiseCorrelatedGaussian/MI/train.py \
+  recipes/PairwiseCorrelatedGaussian/MI/hparams/train_flo.yaml
 ```
 
 See the recipe's README for matrix override examples and validity constraints.
@@ -231,10 +238,11 @@ batch = MIBatch(
 ```
 
 Nonzero mask values identify valid positions. The schema supports these masks,
-but `BilinearFLO` does not yet implement masked estimation and raises
-`NotImplementedError` when either mask is supplied. `PairwiseFLO` supports an
-`x_mask` shaped `(*, count)` or `(*, count, 1)`: for pair `(i, j)`, a sample is
-completely excluded unless both mask positions are valid.
+but `JointFLO` does not yet implement masked estimation and raises
+`NotImplementedError` when either mask is supplied. `PairwiseFLO` and
+`PairwiseBA` support an `x_mask` shaped `(*, count)` or `(*, count, 1)`: for
+pair `(i, j)`, a sample is completely excluded unless both mask positions are
+valid.
 
 ## Project status
 

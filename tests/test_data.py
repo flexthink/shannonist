@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 
 from shannonist.mi import (
     CorrelatedGausian,
-    LatentPairwiseCorrelatentGaussian,
+    LatentPairwiseCorrelatedGaussian,
     PairwiseCorrelatedGaussian,
     tensordict_collate,
     tensordict_passthrough,
@@ -202,11 +202,11 @@ def test_pairwise_correlated_gaussian_validates_dimensions_and_indices() -> None
         dataset[2]
 
 
-def test_latent_pairwise_correlatent_gaussian_batch_and_contexts() -> None:
+def test_latent_pairwise_correlated_gaussian_batch_and_contexts() -> None:
     torch.manual_seed(11)
     mutual_information = torch.full((3, 3), 0.2)
     mutual_information.fill_diagonal_(0)
-    dataset = LatentPairwiseCorrelatentGaussian(
+    dataset = LatentPairwiseCorrelatedGaussian(
         count=8,
         batch_size=5,
         mutual_information=mutual_information,
@@ -236,13 +236,13 @@ def test_latent_pairwise_correlatent_gaussian_batch_and_contexts() -> None:
     )
 
 
-def test_latent_pairwise_correlatent_gaussian_preserves_marginal_mi() -> None:
+def test_latent_pairwise_correlated_gaussian_preserves_marginal_mi() -> None:
     torch.manual_seed(13)
     target = 0.25
     dim = 2
     mutual_information = torch.full((3, 3), target)
     mutual_information.fill_diagonal_(0)
-    dataset = LatentPairwiseCorrelatentGaussian(
+    dataset = LatentPairwiseCorrelatedGaussian(
         count=10,
         batch_size=5,
         mutual_information=mutual_information,
@@ -278,19 +278,19 @@ def test_latent_pairwise_correlatent_gaussian_preserves_marginal_mi() -> None:
         ),
     ],
 )
-def test_latent_pairwise_correlatent_gaussian_validates_constructor(
+def test_latent_pairwise_correlated_gaussian_validates_constructor(
     kwargs: dict[str, int | float],
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=message):
-        LatentPairwiseCorrelatentGaussian(
+        LatentPairwiseCorrelatedGaussian(
             mutual_information=[[0.0, 0.1], [0.1, 0.0]],
             **kwargs,
         )
 
 
-def test_latent_pairwise_correlatent_gaussian_validates_indices() -> None:
-    dataset = LatentPairwiseCorrelatentGaussian(
+def test_latent_pairwise_correlated_gaussian_validates_indices() -> None:
+    dataset = LatentPairwiseCorrelatedGaussian(
         count=3,
         batch_size=2,
         mutual_information=[[0.0, 0.1], [0.1, 0.0]],

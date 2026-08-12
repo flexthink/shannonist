@@ -1,4 +1,4 @@
-"""Train FLO on synthetic correlated Gaussian observations."""
+"""Train an MI estimator on synthetic correlated Gaussian observations."""
 
 from collections.abc import Sequence
 
@@ -8,18 +8,32 @@ from tensordict import TensorDict
 from torch import Tensor
 
 from shannonist.core import Brain, RunOpts, Stage, parse_arguments
-from shannonist.mi import BilinearFLO, BilinearFLOOutput, MIBatch
+from shannonist.mi import (
+    JointFLO,
+    JointFLOOutput,
+    MIBatch,
+    JointBA,
+    JointBAOutput,
+)
 
 
-class FLOBrain(Brain[TensorDict, BilinearFLOOutput]):
-    """SpeechBrain-style training loop for a FLO estimator."""
+MIPrediction = JointFLOOutput | JointBAOutput
+MIEstimator = JointFLO | JointBA
+
+
+class MIBrain(Brain[TensorDict, MIPrediction]):
+    """SpeechBrain-style training loop for a paired MI estimator."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._stage_estimates: list[Tensor] = []
 
     def compute_forward(
         self,
         batch: TensorDict,
         stage: Stage,
-    ) -> BilinearFLOOutput:
-        """Construct an MI batch and run the FLO estimator.
+    ) -> MIPrediction:
+        """Construct an MI batch and run the configured estimator.
 
         Parameters
         ----------
@@ -30,24 +44,20 @@ class FLOBrain(Brain[TensorDict, BilinearFLOOutput]):
 
         Returns
         -------
-        BilinearFLOOutput
-            Critic predictions and auxiliary outputs used by the FLO loss.
+        MIPrediction
+            Estimator-specific predictions and auxiliary outputs.
         """
         mi_batch = MIBatch(
             x=batch["x"],
             y=batch["y"],
             batch_size=batch["x"].shape[:1],
         )
-        estimator = self.modules["estimator"]
-        if not isinstance(estimator, BilinearFLO):
-            raise TypeError("the estimator module must be a BilinearFLO")
-
         del stage
-        return estimator.compute_forward(mi_batch)
+        return self._estimator().compute_forward(mi_batch)
 
     def compute_objectives(
         self,
-        predictions: BilinearFLOOutput,
+        predictions: MIPrediction,
         batch: TensorDict,
         stage: Stage,
     ) -> Tensor:
@@ -55,24 +65,37 @@ class FLOBrain(Brain[TensorDict, BilinearFLOOutput]):
 
         Parameters
         ----------
-        predictions : BilinearFLOOutput
-            FLO output produced by :meth:`compute_forward`.
+        predictions : MIPrediction
+            Estimator output produced by :meth:`compute_forward`.
         batch : TensorDict
-            Input batch. It is unused because FLO embeds its loss in the
-            structured output.
+            Input batch. It is unused because the estimator embeds all values
+            required by its objective in the structured output.
         stage : Stage
             Current experiment stage.
 
         Returns
         -------
         Tensor
-            FLO loss, equal to the negative MI estimate.
+            Loss minimized by the configured estimator.
         """
         del batch, stage
+        objective = self._estimator().compute_objectives(predictions)
+        self._stage_estimates.append(objective.estimate.detach().cpu())
+        return objective.loss
+
+    def on_stage_start(self, stage: Stage, epoch: int | None) -> None:
+        """Reset accumulated MI estimates before each stage."""
+        del stage, epoch
+        self._stage_estimates = []
+
+    def _estimator(self) -> MIEstimator:
+        """Return the configured paired estimator with a checked type."""
         estimator = self.modules["estimator"]
-        if not isinstance(estimator, BilinearFLO):
-            raise TypeError("the estimator module must be a BilinearFLO")
-        return estimator.compute_objectives(predictions).loss
+        if not isinstance(estimator, (JointFLO, JointBA)):
+            raise TypeError(
+                "the estimator module must be a JointFLO or JointBA"
+            )
+        return estimator
 
     def on_stage_end(
         self,
@@ -81,16 +104,17 @@ class FLOBrain(Brain[TensorDict, BilinearFLOOutput]):
         epoch: int | None,
     ) -> None:
         """Report loss, estimated MI, and the target MI after each stage."""
+        mi = torch.stack(self._stage_estimates).mean().item()
         epoch_label = f" epoch={epoch}" if epoch is not None else ""
         print(
             f"stage={stage.name.lower()}{epoch_label} "
-            f"loss={stage_loss:.6f} mi={-stage_loss:.6f} "
+            f"loss={stage_loss:.6f} mi={mi:.6f} "
             f"target_mi={self.hparams.mutual_information:.6f}"
         )
 
 
 def main(arg_list: Sequence[str] | None = None) -> None:
-    """Load recipe hyperparameters and run FLO training.
+    """Load recipe hyperparameters and run MI-estimator training.
 
     Parameters
     ----------
@@ -102,7 +126,7 @@ def main(arg_list: Sequence[str] | None = None) -> None:
         hparams = load_hyperpyyaml(yaml_file, overrides)
 
     torch.manual_seed(hparams["seed"])
-    brain = FLOBrain(
+    brain = MIBrain(
         modules={"estimator": hparams["estimator"]},
         opt_class=hparams["optimizer"],
         hparams=hparams,

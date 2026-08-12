@@ -1,0 +1,56 @@
+seed: 1337
+
+# Synthetic data
+mutual_information: 2.0
+dim: 20
+train_samples: 32768
+valid_samples: 8192
+
+# Training
+number_of_epochs: 20
+batch_size: 256
+lr: 0.0001
+
+# Model. Identity encoding lets the entropy estimator fit the original
+# Gaussian samples directly.
+enc_dim: !ref <dim>
+conditional_proposal: gaussian
+entropy_estimator: gaussian
+proposal_opts: {}
+estimator_opts: {}
+
+train_set: !new:shannonist.mi.CorrelatedGausian
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_samples: !ref <train_samples>
+
+valid_set: !new:shannonist.mi.CorrelatedGausian
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_samples: !ref <valid_samples>
+
+encoder: !new:torch.nn.Identity
+
+estimator: !new:shannonist.mi.JointBA
+    dim: !ref <dim>
+    enc_dim: !ref <enc_dim>
+    encoder: !ref <encoder>
+    conditional_proposal: !ref <conditional_proposal>
+    entropy_estimator: !ref <entropy_estimator>
+    proposal_opts: !ref <proposal_opts>
+    estimator_opts: !ref <estimator_opts>
+
+optimizer: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+train_loader_kwargs:
+    batch_size: !ref <batch_size>
+    shuffle: True
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_collate
+
+valid_loader_kwargs:
+    batch_size: !ref <batch_size>
+    shuffle: False
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_collate
