@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from tensordict import TensorClass, TensorDict
 from torch import Tensor
@@ -33,13 +33,19 @@ class Estimator(ABC, Generic[InputT, EstimateT]):
     """Interface for estimating a quantity from a batch."""
 
     @abstractmethod
-    def estimate(self, batch: InputT) -> EstimateT:
+    def estimate(
+        self,
+        batch: InputT,
+        options: dict[str, Any] | None = None,
+    ) -> EstimateT:
         """Compute an estimate from a batch.
 
         Parameters
         ----------
         batch : InputT
             Typed input batch expected by the estimator.
+        options : dict[str, Any], optional
+            Method-specific estimation options.
 
         Returns
         -------

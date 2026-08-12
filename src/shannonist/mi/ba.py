@@ -944,19 +944,27 @@ class JointBA(
             batch_size=[],
         )
 
-    def estimate(self, batch: MIBatch) -> MIEstimate:
+    def estimate(
+        self,
+        batch: MIBatch,
+        options: dict[str, Any] | None = None,
+    ) -> MIEstimate:
         """Estimate the Barber-Agakov lower bound.
 
         Parameters
         ----------
         batch : MIBatch
             Paired observations.
+        options : dict[str, Any], optional
+            Method-specific estimation options. Joint BA accepts none.
 
         Returns
         -------
         MIEstimate
             Scalar lower-bound estimate and diagnostics.
         """
+        if options:
+            raise ValueError("JointBA does not support estimate options")
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
         return MIEstimate(
@@ -1271,8 +1279,14 @@ class PairwiseBA(
             batch_size=[],
         )
 
-    def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
+    def estimate(
+        self,
+        batch: PairwiseMIBatch,
+        options: dict[str, Any] | None = None,
+    ) -> MIEstimate:
         """Estimate a symmetric pairwise mutual-information matrix."""
+        if options:
+            raise ValueError("PairwiseBA does not support estimate options")
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
         return MIEstimate(
@@ -1610,14 +1624,118 @@ class SampledPairwiseBA(
             batch_size=[],
         )
 
-    def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
-        """Estimate mean MI across newly sampled variable pairs."""
+    def estimate(
+        self,
+        batch: PairwiseMIBatch,
+        options: dict[str, Any] | None = None,
+    ) -> MIEstimate:
+        """Estimate sampled mean MI or a full per-observation MI matrix.
+
+        Parameters
+        ----------
+        batch : PairwiseMIBatch
+            Observations shaped ``(batch, count, dim)``.
+        options : dict[str, Any], optional
+            Method-specific options. ``mode`` may be ``"sampled"`` (the
+            default) or ``"full"``. Full mode returns a symmetric
+            ``(batch, count, count)`` matrix with a zero diagonal and zeros
+            for pairs containing a masked position.
+
+        Returns
+        -------
+        MIEstimate
+            Scalar sampled estimate or full per-observation matrix.
+
+        Raises
+        ------
+        ValueError
+            If an unknown option or mode is supplied, or full mode receives
+            an input without exactly batch, count, and feature dimensions.
+        """
+        options = dict(options or {})
+        mode = options.pop("mode", "sampled")
+        if options:
+            unexpected = ", ".join(sorted(options))
+            raise ValueError(f"unknown SampledPairwiseBA options: {unexpected}")
+        if mode == "full":
+            return self._estimate_full(batch)
+        if mode != "sampled":
+            raise ValueError("mode must be 'sampled' or 'full'")
+
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
         return MIEstimate(
             value=objective.estimate,
             details=objective.metrics,
             batch_size=[],
+        )
+
+    def _estimate_full(self, batch: PairwiseMIBatch) -> MIEstimate:
+        """Evaluate every distinct variable pair for each observation."""
+        x = batch.x
+        if x.ndim != 3:
+            raise ValueError("full mode requires x with shape (batch, count, dim)")
+        batch_size, count, feature_dim = x.shape
+        if feature_dim != self.dim:
+            raise ValueError(
+                f"expected feature dimension {self.dim}, got {feature_dim}"
+            )
+        mask = self._normalize_mask(batch.x_mask, x)
+        hx = x.new_zeros(batch_size, count, self.enc_dim)
+        if mask.any():
+            encoded = self.encoder(x[mask])
+            if encoded.shape != (int(mask.sum().item()), self.enc_dim):
+                raise ValueError(
+                    "encoder must return shape (valid_count, enc_dim); "
+                    f"got {tuple(encoded.shape)}"
+                )
+            hx[mask] = encoded
+
+        entropy = hx.new_zeros(batch_size, count)
+        if mask.any():
+            entropy[mask] = self.entropy_estimator(hx[mask])
+
+        target = hx.unsqueeze(-2).expand(
+            batch_size,
+            count,
+            count,
+            self.enc_dim,
+        )
+        condition = hx.unsqueeze(-3).expand_as(target)
+        conditional_params = self.conditional_proposal(condition)
+        conditional_log_prob = self.conditional_proposal.log_prob(
+            target,
+            conditional_params,
+        )
+        pair_valid = mask.unsqueeze(-1) & mask.unsqueeze(-2)
+        if not torch.all(torch.isfinite(conditional_log_prob[pair_valid])):
+            raise ValueError("valid conditional log-probabilities must be finite")
+
+        directed_estimate = entropy.unsqueeze(-1) + conditional_log_prob
+        estimate_matrix = (
+            directed_estimate + directed_estimate.transpose(-1, -2)
+        ) / 2
+        diagonal = torch.eye(
+            count,
+            dtype=torch.bool,
+            device=x.device,
+        ).unsqueeze(0)
+        estimate_matrix = estimate_matrix.masked_fill(~pair_valid, 0)
+        estimate_matrix = estimate_matrix.masked_fill(diagonal, 0)
+        details = TensorDict(
+            {
+                "estimate_matrix": estimate_matrix,
+                "directed_estimate": directed_estimate,
+                "entropy_vec": entropy,
+                "conditional_log_prob": conditional_log_prob,
+                "mask": mask,
+            },
+            batch_size=[batch_size],
+        )
+        return MIEstimate(
+            value=estimate_matrix,
+            details=details,
+            batch_size=[batch_size],
         )
 
 

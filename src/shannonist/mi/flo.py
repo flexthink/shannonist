@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 from tensordict import TensorClass, TensorDict
 from torch import Tensor, nn
@@ -197,19 +199,27 @@ class JointFLO(
         assert details is not None
         return objective.estimate, details
 
-    def estimate(self, batch: MIBatch) -> MIEstimate:
+    def estimate(
+        self,
+        batch: MIBatch,
+        options: dict[str, Any] | None = None,
+    ) -> MIEstimate:
         """Estimate mutual information for a batch.
 
         Parameters
         ----------
         batch : MIBatch
             Paired, unmasked observations.
+        options : dict[str, Any], optional
+            Method-specific estimation options. Joint FLO accepts none.
 
         Returns
         -------
         MIEstimate
             FLO mutual-information estimate and diagnostic tensors.
         """
+        if options:
+            raise ValueError("JointFLO does not support estimate options")
         predictions = self.compute_forward(batch)
         value, details = self.MI(predictions)
         return MIEstimate(value=value, details=details, batch_size=[])
@@ -470,19 +480,27 @@ class PairwiseFLO(
             batch_size=[],
         )
 
-    def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
+    def estimate(
+        self,
+        batch: PairwiseMIBatch,
+        options: dict[str, Any] | None = None,
+    ) -> MIEstimate:
         """Estimate a symmetric pairwise mutual-information matrix.
 
         Parameters
         ----------
         batch : PairwiseMIBatch
             Observations with shape ``(*, count, features)``.
+        options : dict[str, Any], optional
+            Method-specific estimation options. Pairwise FLO accepts none.
 
         Returns
         -------
         MIEstimate
             Estimate with shape ``(count, count)`` and a zero diagonal.
         """
+        if options:
+            raise ValueError("PairwiseFLO does not support estimate options")
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
         details = objective.metrics
@@ -802,19 +820,30 @@ class ContrastivePairwiseFLO(
             batch_size=[],
         )
 
-    def estimate(self, batch: PairwiseMIBatch) -> MIEstimate:
+    def estimate(
+        self,
+        batch: PairwiseMIBatch,
+        options: dict[str, Any] | None = None,
+    ) -> MIEstimate:
         """Estimate mean MI across newly sampled sequence-position pairs.
 
         Parameters
         ----------
         batch : PairwiseMIBatch
             Masked or unmasked sequence observations.
+        options : dict[str, Any], optional
+            Method-specific estimation options. Contrastive pairwise FLO
+            accepts none.
 
         Returns
         -------
         MIEstimate
             Scalar sampled FLO lower bound and diagnostic tensors.
         """
+        if options:
+            raise ValueError(
+                "ContrastivePairwiseFLO does not support estimate options"
+            )
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
         return MIEstimate(

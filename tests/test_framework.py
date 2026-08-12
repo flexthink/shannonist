@@ -2,6 +2,8 @@ import inspect
 
 import pytest
 import torch
+from typing import Any
+
 from tensordict import TensorClass
 
 from shannonist.framework import Estimator, ObjectiveOutput, TrainableEstimator
@@ -29,7 +31,12 @@ class ConcreteEstimator(TrainableEstimator[Input, Prediction, Estimate]):
         mean = predictions.value.mean()
         return ObjectiveOutput(loss=mean, estimate=mean, batch_size=[])
 
-    def estimate(self, batch: Input) -> Estimate:
+    def estimate(
+        self,
+        batch: Input,
+        options: dict[str, Any] | None = None,
+    ) -> Estimate:
+        del options
         predictions = self.compute_forward(batch)
         return Estimate(value=predictions.value.mean(), batch_size=[])
 

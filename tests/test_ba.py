@@ -971,3 +971,60 @@ def test_sampled_pairwise_ba_validates_sample_size_and_masks() -> None:
     )
     with pytest.raises(ValueError, match="x_mask"):
         estimator.compute_forward(invalid_mask)
+
+
+def test_sampled_pairwise_ba_full_mode_returns_per_observation_matrices() -> None:
+    estimator = make_sampled_pairwise_ba(sample_size=2)
+    mask = torch.tensor(
+        [[1, 1, 1, 0], [1, 0, 1, 1]],
+        dtype=torch.bool,
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(2, 4, 2),
+        x_mask=mask.unsqueeze(-1),
+        batch_size=[2],
+    )
+
+    estimate = estimator.estimate(batch, {"mode": "full"})
+
+    expected = torch.full((2, 4, 4), torch.log(torch.tensor(2.0)))
+    pair_valid = mask.unsqueeze(-1) & mask.unsqueeze(-2)
+    expected.masked_fill_(~pair_valid, 0)
+    expected.diagonal(dim1=-2, dim2=-1).zero_()
+    assert estimate.batch_size == torch.Size([2])
+    assert estimate.value.shape == (2, 4, 4)
+    assert torch.allclose(estimate.value, expected)
+    assert torch.equal(estimate.value, estimate.value.transpose(-1, -2))
+    assert torch.count_nonzero(
+        estimate.value.diagonal(dim1=-2, dim2=-1)
+    ) == 0
+    assert torch.equal(estimate.details["mask"], mask)
+
+
+def test_sampled_pairwise_ba_estimate_modes_and_options() -> None:
+    estimator = make_sampled_pairwise_ba(sample_size=2)
+    batch = PairwiseMIBatch(
+        x=torch.randn(3, 4, 2),
+        batch_size=[3],
+    )
+
+    default = estimator.estimate(batch)
+    sampled = estimator.estimate(batch, {"mode": "sampled"})
+
+    assert default.value.ndim == 0
+    assert sampled.value.ndim == 0
+    with pytest.raises(ValueError, match="mode"):
+        estimator.estimate(batch, {"mode": "mystery"})
+    with pytest.raises(ValueError, match="unknown"):
+        estimator.estimate(batch, {"mystery": True})
+
+
+def test_sampled_pairwise_ba_full_mode_requires_three_dimensions() -> None:
+    estimator = make_sampled_pairwise_ba(sample_size=2)
+    batch = PairwiseMIBatch(
+        x=torch.randn(2, 3, 4, 2),
+        batch_size=[2, 3],
+    )
+
+    with pytest.raises(ValueError, match=r"\(batch, count, dim\)"):
+        estimator.estimate(batch, {"mode": "full"})
