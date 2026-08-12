@@ -30,17 +30,21 @@ class MIBatch(TensorClass):
 
 
 class MIEstimate(TensorClass):
-    """Mutual-information estimate and optional diagnostic values.
+    """Mutual-information estimate, entropies, and optional diagnostics.
 
     Parameters
     ----------
     value : Tensor
         Estimated mutual information.
+    entropies : Tensor, optional
+        Entropy values returned by estimators that model marginal entropy.
+        The shape is method-specific.
     details : TensorDict, optional
         Estimator-specific diagnostic values.
     """
 
     value: Tensor
+    entropies: Tensor | None = None
     details: TensorDict | None = None
 
 

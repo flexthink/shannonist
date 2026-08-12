@@ -500,6 +500,7 @@ def test_joint_ba_accepts_proposals_and_encoder() -> None:
     estimate = estimator.estimate(batch)
     assert estimate.value.ndim == 0
     assert torch.isfinite(estimate.value)
+    assert estimate.entropies.shape == (4,)
 
 
 def test_joint_ba_bound_combines_entropy_and_conditional_density() -> None:
@@ -749,6 +750,7 @@ def test_pairwise_ba_returns_symmetric_matrix_and_zero_diagonal() -> None:
     assert predictions.mask.shape == (8, 3)
     assert torch.allclose(objective.estimate, expected)
     assert torch.allclose(estimate.value, expected)
+    assert estimate.entropies.shape == (8, 3)
     raw_loss = -expected.triu(1).sum() / 3
     assert torch.allclose(objective.loss, raw_loss / estimator.enc_dim)
 
@@ -1011,12 +1013,19 @@ def test_sampled_pairwise_ba_full_mode_returns_per_observation_matrices() -> Non
     expected.diagonal(dim1=-2, dim2=-1).zero_()
     assert estimate.batch_size == torch.Size([2])
     assert estimate.value.shape == (2, 4, 4)
+    assert estimate.entropies.shape == (2, 4)
     assert torch.allclose(estimate.value, expected)
     assert torch.equal(estimate.value, estimate.value.transpose(-1, -2))
     assert torch.count_nonzero(
         estimate.value.diagonal(dim1=-2, dim2=-1)
     ) == 0
     assert torch.equal(estimate.details["mask"], mask)
+    expected_entropies = torch.full(
+        (2, 4),
+        torch.log(torch.tensor(4.0)),
+    )
+    expected_entropies.masked_fill_(~mask, 0)
+    assert torch.allclose(estimate.entropies, expected_entropies)
 
 
 def test_sampled_pairwise_ba_estimate_modes_and_options() -> None:
@@ -1031,6 +1040,8 @@ def test_sampled_pairwise_ba_estimate_modes_and_options() -> None:
 
     assert default.value.ndim == 0
     assert sampled.value.ndim == 0
+    assert default.entropies.shape == (3, 2, 2)
+    assert sampled.entropies.shape == (3, 2, 2)
     with pytest.raises(ValueError, match="mode"):
         estimator.estimate(batch, {"mode": "mystery"})
     with pytest.raises(ValueError, match="unknown"):

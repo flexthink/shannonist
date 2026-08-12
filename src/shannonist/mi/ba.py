@@ -965,7 +965,8 @@ class JointBA(
         Returns
         -------
         MIEstimate
-            Scalar lower-bound estimate and diagnostics.
+            Scalar lower-bound estimate, per-observation entropies, and
+            diagnostics.
         """
         if options:
             raise ValueError("JointBA does not support estimate options")
@@ -973,6 +974,7 @@ class JointBA(
         objective = self.compute_objectives(predictions)
         return MIEstimate(
             value=objective.estimate,
+            entropies=predictions.entropy.detach(),
             details=objective.metrics,
             batch_size=[],
         )
@@ -1292,13 +1294,14 @@ class PairwiseBA(
         batch: PairwiseMIBatch,
         options: dict[str, Any] | None = None,
     ) -> MIEstimate:
-        """Estimate a symmetric pairwise mutual-information matrix."""
+        """Estimate a pairwise MI matrix and return position entropies."""
         if options:
             raise ValueError("PairwiseBA does not support estimate options")
         predictions = self.compute_forward(batch)
         objective = self.compute_objectives(predictions)
         return MIEstimate(
             value=objective.estimate,
+            entropies=predictions.entropy.detach(),
             details=objective.metrics,
             batch_size=[],
         )
@@ -1658,7 +1661,9 @@ class SampledPairwiseBA(
         Returns
         -------
         MIEstimate
-            Scalar sampled estimate or full per-observation matrix.
+            Scalar sampled estimate or full per-observation matrix. The
+            ``entropies`` field follows sampled pairs in sampled mode and has
+            shape ``(batch, count)`` in full mode, with masked positions zero.
 
         Raises
         ------
@@ -1691,6 +1696,7 @@ class SampledPairwiseBA(
         objective = self.compute_objectives(predictions)
         return MIEstimate(
             value=objective.estimate,
+            entropies=predictions.entropy.detach(),
             details=objective.metrics,
             batch_size=[],
         )
@@ -1803,6 +1809,7 @@ class SampledPairwiseBA(
         )
         return MIEstimate(
             value=estimate_matrix,
+            entropies=entropy,
             details=details,
             batch_size=[batch_size],
         )
