@@ -53,13 +53,20 @@ class Invertible(nn.Module, ABC):
     """Interface for an invertible neural-network transformation."""
 
     @abstractmethod
-    def forward(self, x: Tensor) -> InvertibleOutput:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Apply the forward transformation.
 
         Parameters
         ----------
         x : Tensor
             Input tensor.
+        cond : Tensor, optional
+            Optional conditioning tensor. Implementations that do not support
+            conditioning may ignore it.
 
         Returns
         -------
@@ -69,13 +76,20 @@ class Invertible(nn.Module, ABC):
         ...
 
     @abstractmethod
-    def inverse(self, y: Tensor) -> InvertibleOutput:
+    def inverse(
+        self,
+        y: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Apply the inverse transformation.
 
         Parameters
         ----------
         y : Tensor
             Transformed tensor.
+        cond : Tensor, optional
+            Optional conditioning tensor. Implementations that do not support
+            conditioning may ignore it.
 
         Returns
         -------
@@ -199,13 +213,19 @@ class InvertibleLinear(Invertible):
         """Return the log-absolute-determinant of the weight."""
         return self.log_diag.sum()
 
-    def forward(self, x: Tensor) -> InvertibleOutput:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Apply the affine transformation.
 
         Parameters
         ----------
         x : Tensor
             Input with shape ``(*, dim)``.
+        cond : Tensor, optional
+            Ignored; this transformation is unconditional.
 
         Returns
         -------
@@ -226,13 +246,19 @@ class InvertibleLinear(Invertible):
             batch_size=batch_size,
         )
 
-    def inverse(self, y: Tensor) -> InvertibleOutput:
+    def inverse(
+        self,
+        y: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Invert the affine transformation using an LU solve.
 
         Parameters
         ----------
         y : Tensor
             Transformed values with shape ``(*, dim)``.
+        cond : Tensor, optional
+            Ignored; this transformation is unconditional.
 
         Returns
         -------
@@ -273,6 +299,176 @@ class InvertibleLinear(Invertible):
             raise ValueError(f"input must have trailing dimension {self.dim}")
 
 
+class ConditionedInvertibleLinearLayer(Invertible):
+    r"""Apply an affine map parameterized by a conditioning hypernetwork.
+
+    The hypernetwork maps ``cond`` to the strict triangles of ``L`` and ``U``,
+    the logarithm of the positive diagonal of ``U``, and an optional bias. The
+    resulting weight ``L @ U`` is invertible by construction for every
+    conditioning value. The hypernetwork's output layer is initialized to zero,
+    making the initial transformation the identity map.
+
+    Parameters
+    ----------
+    dim : int
+        Input and output feature dimension.
+    cond_dim : int
+        Trailing dimension of the conditioning tensor.
+    hidden_dims : Sequence[int], optional
+        Widths of the hypernetwork hidden layers. Defaults to one layer of
+        width ``dim``.
+    bias : bool, default=True
+        Whether the hypernetwork should produce an additive bias.
+    """
+
+    lower_indices: Tensor
+    upper_indices: Tensor
+
+    def __init__(
+        self,
+        dim: int,
+        cond_dim: int,
+        hidden_dims: Sequence[int] | None = None,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        if dim <= 0:
+            raise ValueError("dim must be positive")
+        if cond_dim <= 0:
+            raise ValueError("cond_dim must be positive")
+        if hidden_dims is None:
+            hidden_dims = (dim,)
+        if any(width <= 0 for width in hidden_dims):
+            raise ValueError("all hidden dimensions must be positive")
+
+        self.dim = dim
+        self.cond_dim = cond_dim
+        self.hidden_dims = tuple(hidden_dims)
+        self.use_bias = bias
+        self.triangle_size = dim * (dim - 1) // 2
+        self.register_buffer(
+            "lower_indices",
+            torch.tril_indices(dim, dim, offset=-1),
+        )
+        self.register_buffer(
+            "upper_indices",
+            torch.triu_indices(dim, dim, offset=1),
+        )
+        parameter_dim = 2 * self.triangle_size + dim
+        if bias:
+            parameter_dim += dim
+
+        widths = (cond_dim, *self.hidden_dims, parameter_dim)
+        modules: list[nn.Module] = []
+        for index, (input_width, output_width) in enumerate(
+            zip(widths[:-1], widths[1:], strict=True)
+        ):
+            linear = nn.Linear(input_width, output_width)
+            if index < len(widths) - 2:
+                nn.init.xavier_uniform_(linear.weight)
+                nn.init.zeros_(linear.bias)
+                modules.extend((linear, nn.ReLU()))
+            else:
+                nn.init.zeros_(linear.weight)
+                nn.init.zeros_(linear.bias)
+                modules.append(linear)
+        self.hypernetwork = nn.Sequential(*modules)
+
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
+        """Apply the conditioned affine transformation."""
+        x, cond = self._validate_and_broadcast(x, cond)
+        lower, upper, bias, log_abs_det = self._factors(cond)
+        value = torch.einsum("...ij,...j->...i", upper, x)
+        value = torch.einsum("...ij,...j->...i", lower, value)
+        if bias is not None:
+            value = value + bias
+        return InvertibleOutput(
+            value=value,
+            log_abs_det=log_abs_det,
+            batch_size=x.shape[:-1],
+        )
+
+    def inverse(
+        self,
+        y: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
+        """Invert the conditioned affine transformation."""
+        y, cond = self._validate_and_broadcast(y, cond)
+        lower, upper, bias, log_abs_det = self._factors(cond)
+        centered = y if bias is None else y - bias
+        intermediate = torch.linalg.solve_triangular(
+            lower,
+            centered.unsqueeze(-1),
+            upper=False,
+            unitriangular=True,
+        )
+        value = torch.linalg.solve_triangular(
+            upper,
+            intermediate,
+            upper=True,
+        ).squeeze(-1)
+        return InvertibleOutput(
+            value=value,
+            log_abs_det=-log_abs_det,
+            batch_size=y.shape[:-1],
+        )
+
+    def _factors(
+        self,
+        cond: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
+        """Construct batched triangular factors from the hypernetwork."""
+        parameters = self.hypernetwork(cond)
+        offset = 0
+        lower_params = parameters[..., : self.triangle_size]
+        offset += self.triangle_size
+        upper_params = parameters[..., offset : offset + self.triangle_size]
+        offset += self.triangle_size
+        log_diag = parameters[..., offset : offset + self.dim]
+        offset += self.dim
+        bias = parameters[..., offset:] if self.use_bias else None
+
+        shape = (*cond.shape[:-1], self.dim, self.dim)
+        lower = cond.new_zeros(shape)
+        upper = cond.new_zeros(shape)
+        lower[..., self.lower_indices[0], self.lower_indices[1]] = lower_params
+        upper[..., self.upper_indices[0], self.upper_indices[1]] = upper_params
+        identity = torch.eye(self.dim, dtype=cond.dtype, device=cond.device)
+        lower = lower + identity
+        upper = upper + torch.diag_embed(log_diag.exp())
+        return lower, upper, bias, log_diag.sum(dim=-1)
+
+    def _validate_and_broadcast(
+        self,
+        value: Tensor,
+        cond: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Validate feature dimensions and broadcast batch dimensions."""
+        if value.ndim == 0 or value.shape[-1] != self.dim:
+            raise ValueError(
+                f"input must have trailing dimension {self.dim}"
+            )
+        if cond is None:
+            raise ValueError("cond is required for a conditioned layer")
+        if cond.ndim == 0 or cond.shape[-1] != self.cond_dim:
+            raise ValueError(
+                f"cond must have trailing dimension {self.cond_dim}"
+            )
+        batch_shape = torch.broadcast_shapes(
+            value.shape[:-1],
+            cond.shape[:-1],
+        )
+        return (
+            value.expand(*batch_shape, self.dim),
+            cond.expand(*batch_shape, self.cond_dim),
+        )
+
+
 class InvertibleLeakyReLU(Invertible):
     r"""Apply an invertible leaky-ReLU activation.
 
@@ -292,7 +488,11 @@ class InvertibleLeakyReLU(Invertible):
             raise ValueError("negative_slope must be finite and positive")
         self.negative_slope = negative_slope
 
-    def forward(self, x: Tensor) -> InvertibleOutput:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Apply the activation and compute its forward log-determinant."""
         if x.ndim == 0:
             raise ValueError("input must have a trailing feature dimension")
@@ -306,7 +506,11 @@ class InvertibleLeakyReLU(Invertible):
             batch_size=x.shape[:-1],
         )
 
-    def inverse(self, y: Tensor) -> InvertibleOutput:
+    def inverse(
+        self,
+        y: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Apply the analytic inverse and its inverse log-determinant."""
         if y.ndim == 0:
             raise ValueError("input must have a trailing feature dimension")
@@ -340,6 +544,10 @@ class InvertibleMLP(Invertible):
         Activation used after every non-final linear layer. Defaults to
         :class:`InvertibleLeakyReLU`. Each position receives an independent
         copy of the supplied module.
+    use_conditioning : bool, default=False
+        Whether to replace affine layers with
+        :class:`ConditionedInvertibleLinearLayer`. Conditioning tensors then
+        have trailing dimension ``input_dim``.
     Raises
     ------
     ValueError
@@ -352,6 +560,7 @@ class InvertibleMLP(Invertible):
         hidden_dims: Sequence[int],
         output_dim: int,
         activation: Invertible | None = None,
+        use_conditioning: bool = False,
     ) -> None:
         super().__init__()
         dimensions = (input_dim, *hidden_dims, output_dim)
@@ -366,6 +575,7 @@ class InvertibleMLP(Invertible):
         self.hidden_dims = tuple(hidden_dims)
         self.output_dim = output_dim
         self.dim = input_dim
+        self.use_conditioning = use_conditioning
         if activation is None:
             activation = InvertibleLeakyReLU()
         if not isinstance(activation, Invertible):
@@ -379,24 +589,39 @@ class InvertibleMLP(Invertible):
             else 1.0
         )
         layer_count = len(dimensions) - 1
-        self.layers = nn.ModuleList(
-            InvertibleLinear(
-                input_dim,
-                gain=gain if index < layer_count - 1 else 1.0,
+        if use_conditioning:
+            self.layers = nn.ModuleList(
+                ConditionedInvertibleLinearLayer(
+                    input_dim,
+                    cond_dim=input_dim,
+                )
+                for _ in range(layer_count)
             )
-            for index in range(layer_count)
-        )
+        else:
+            self.layers = nn.ModuleList(
+                InvertibleLinear(
+                    input_dim,
+                    gain=gain if index < layer_count - 1 else 1.0,
+                )
+                for index in range(layer_count)
+            )
         self.activations = nn.ModuleList(
             deepcopy(activation) for _ in range(len(self.layers) - 1)
         )
 
-    def forward(self, x: Tensor) -> InvertibleOutput:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Apply every invertible layer in order.
 
         Parameters
         ----------
         x : Tensor
             Input with shape ``(*, input_dim)``.
+        cond : Tensor, optional
+            Optional conditioning tensor propagated to every component.
 
         Returns
         -------
@@ -406,11 +631,11 @@ class InvertibleMLP(Invertible):
         """
         log_abs_det = x.new_zeros(x.shape[:-1])
         for index, layer in enumerate(self.layers):
-            output = layer(x)
+            output = layer(x, cond=cond)
             x = output.value
             log_abs_det = log_abs_det + output.log_abs_det
             if index < len(self.activations):
-                output = self.activations[index](x)
+                output = self.activations[index](x, cond=cond)
                 x = output.value
                 log_abs_det = log_abs_det + output.log_abs_det
         return InvertibleOutput(
@@ -419,13 +644,19 @@ class InvertibleMLP(Invertible):
             batch_size=x.shape[:-1],
         )
 
-    def inverse(self, y: Tensor) -> InvertibleOutput:
+    def inverse(
+        self,
+        y: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
         """Apply every layer inverse in reverse order.
 
         Parameters
         ----------
         y : Tensor
             Transformed values with shape ``(*, output_dim)``.
+        cond : Tensor, optional
+            Optional conditioning tensor propagated to every component.
 
         Returns
         -------
@@ -436,11 +667,11 @@ class InvertibleMLP(Invertible):
         log_abs_det = y.new_zeros(y.shape[:-1])
         for index in reversed(range(len(self.layers))):
             layer = self.layers[index]
-            output = layer.inverse(y)
+            output = layer.inverse(y, cond=cond)
             y = output.value
             log_abs_det = log_abs_det + output.log_abs_det
             if index > 0:
-                output = self.activations[index - 1].inverse(y)
+                output = self.activations[index - 1].inverse(y, cond=cond)
                 y = output.value
                 log_abs_det = log_abs_det + output.log_abs_det
         return InvertibleOutput(
@@ -512,6 +743,7 @@ class FlowDensityEstimator(nn.Module):
     def forward(
         self,
         sample_shape: torch.Size | Sequence[int] = torch.Size(),
+        cond: Tensor | None = None,
     ) -> FlowDensityOutput:
         """Sample from the prior and transform into data space.
 
@@ -519,6 +751,8 @@ class FlowDensityEstimator(nn.Module):
         ----------
         sample_shape : torch.Size or Sequence[int], default=torch.Size()
             Leading shape of the requested samples.
+        cond : Tensor, optional
+            Optional conditioning tensor passed to the transformation.
 
         Returns
         -------
@@ -527,7 +761,8 @@ class FlowDensityEstimator(nn.Module):
             forward log-absolute-determinants.
         """
         latent = self.prior.sample(torch.Size(sample_shape))
-        transformed = self.transform(latent)
+        transformed = self.transform(latent, cond=cond)
+        latent = latent.expand_as(transformed.value)
         prior_log_prob = self.prior.log_prob(latent)
         self._validate_log_prob_shapes(prior_log_prob, transformed.log_abs_det)
         return FlowDensityOutput(
@@ -538,13 +773,19 @@ class FlowDensityEstimator(nn.Module):
             batch_size=prior_log_prob.shape,
         )
 
-    def evaluate(self, value: Tensor) -> FlowDensityOutput:
+    def evaluate(
+        self,
+        value: Tensor,
+        cond: Tensor | None = None,
+    ) -> FlowDensityOutput:
         """Evaluate data-space values using the inverse transformation.
 
         Parameters
         ----------
         value : Tensor
             Values in the modeled data space.
+        cond : Tensor, optional
+            Optional conditioning tensor passed to the transformation.
 
         Returns
         -------
@@ -552,7 +793,7 @@ class FlowDensityEstimator(nn.Module):
             Input values, recovered latent values, log-densities, and inverse
             log-absolute-determinants.
         """
-        inverted = self.transform.inverse(value)
+        inverted = self.transform.inverse(value, cond=cond)
         prior_log_prob = self.prior.log_prob(inverted.value)
         self._validate_log_prob_shapes(prior_log_prob, inverted.log_abs_det)
         return FlowDensityOutput(
@@ -563,13 +804,21 @@ class FlowDensityEstimator(nn.Module):
             batch_size=prior_log_prob.shape,
         )
 
-    def log_prob(self, value: Tensor) -> Tensor:
+    def log_prob(
+        self,
+        value: Tensor,
+        cond: Tensor | None = None,
+    ) -> Tensor:
         """Return the flow log-density of arbitrary data-space values."""
-        return self.evaluate(value).log_prob
+        return self.evaluate(value, cond=cond).log_prob
 
-    def prob(self, value: Tensor) -> Tensor:
+    def prob(
+        self,
+        value: Tensor,
+        cond: Tensor | None = None,
+    ) -> Tensor:
         """Return the flow density of arbitrary data-space values."""
-        return self.log_prob(value).exp()
+        return self.log_prob(value, cond=cond).exp()
 
     @staticmethod
     def _validate_log_prob_shapes(
@@ -585,6 +834,7 @@ class FlowDensityEstimator(nn.Module):
 
 
 __all__ = [
+    "ConditionedInvertibleLinearLayer",
     "FlowDensityEstimator",
     "FlowDensityOutput",
     "Invertible",

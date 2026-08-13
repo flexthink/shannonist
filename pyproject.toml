@@ -12,6 +12,7 @@ dependencies = [
     "hyperpyyaml",
     "tensordict",
     "torch",
+    "tqdm",
 ]
 
 [project.optional-dependencies]

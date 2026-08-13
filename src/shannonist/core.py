@@ -1,5 +1,4 @@
 import argparse
-import sys
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ import torch
 from torch import Tensor, nn
 from torch.optim import Optimizer
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 
 BatchT = TypeVar("BatchT")
@@ -205,12 +205,12 @@ class Brain(ABC, Generic[BatchT, ForwardT]):
 
         for epoch in epochs:
             self.on_stage_start(Stage.TRAIN, epoch)
-            train_loss = self._run_stage(train_loader, Stage.TRAIN)
+            train_loss = self._run_stage(train_loader, Stage.TRAIN, epoch)
             self.on_stage_end(Stage.TRAIN, train_loss, epoch)
 
             if valid_loader is not None:
                 self.on_stage_start(Stage.VALID, epoch)
-                valid_loss = self._run_stage(valid_loader, Stage.VALID)
+                valid_loss = self._run_stage(valid_loader, Stage.VALID, epoch)
                 self.on_stage_end(Stage.VALID, valid_loss, epoch)
 
     def evaluate(
@@ -234,7 +234,7 @@ class Brain(ABC, Generic[BatchT, ForwardT]):
         """
         loader = self.make_dataloader(test_set, test_loader_kwargs)
         self.on_stage_start(Stage.TEST, None)
-        loss = self._run_stage(loader, Stage.TEST)
+        loss = self._run_stage(loader, Stage.TEST, None)
         self.on_stage_end(Stage.TEST, loss, None)
         return loss
 
@@ -279,16 +279,34 @@ class Brain(ABC, Generic[BatchT, ForwardT]):
         epoch_label = f" epoch={epoch}" if epoch is not None else ""
         print(f"stage={stage.name.lower()}{epoch_label} loss={stage_loss:.6f}")
 
-    def _run_stage(self, loader: DataLoader[Any], stage: Stage) -> float:
-        """Run one complete training, validation, or test stage."""
+    def _run_stage(
+        self,
+        loader: DataLoader[Any],
+        stage: Stage,
+        epoch: int | None,
+    ) -> float:
+        """Run one stage with a live batch-level loss display."""
         is_training = stage is Stage.TRAIN
         self.modules.train(is_training)
         total = 0.0
         count = 0
-        for batch in loader:
-            loss = self.fit_batch(batch) if is_training else self.evaluate_batch(batch, stage)
+        epoch_label = f" epoch {epoch}" if epoch is not None else ""
+        batches = tqdm(
+            loader,
+            desc=f"{stage.name.lower()}{epoch_label}",
+            unit="batch",
+            dynamic_ncols=True,
+            leave=False,
+        )
+        for batch in batches:
+            loss = (
+                self.fit_batch(batch)
+                if is_training
+                else self.evaluate_batch(batch, stage)
+            )
             total += loss.item()
             count += 1
+            batches.set_postfix(loss=f"{total / count:.6f}")
 
         if count == 0:
             raise ValueError(f"{stage.name.lower()} data loader is empty")

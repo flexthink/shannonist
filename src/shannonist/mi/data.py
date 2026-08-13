@@ -259,6 +259,92 @@ class PairwiseCorrelatedGaussian(Dataset[TensorDict]):
         return TensorDict({"x": self.factor @ latent}, batch_size=[])
 
 
+class ConditionedPairwiseCorrelatedGaussian(Dataset[TensorDict]):
+    """Mixture of two pairwise Gaussian regimes with noisy context vectors.
+
+    Each item randomly selects one of two
+    :class:`PairwiseCorrelatedGaussian` distributions. Its conditioning vector
+    is sampled from an isotropic Gaussian whose mean identifies the selected
+    regime. The two context distributions share a covariance, allowing their
+    degree of overlap to be controlled independently of the MI matrices.
+
+    Parameters
+    ----------
+    mutual_information : Sequence[Tensor or Sequence[Sequence[float]]]
+        Exactly two pairwise mutual-information matrices.
+    dim : int, default=1
+        Feature dimension of each Gaussian variable.
+    cond_dim : int, optional
+        Conditioning-vector dimension. Defaults to ``dim``.
+    context_separation : float, default=1.0
+        Distance between the two isotropic-Gaussian context means.
+    context_std : float, default=1.0
+        Shared standard deviation of the context distributions.
+    num_samples : int, default=10000
+        Number of samples exposed by the dataset.
+    """
+
+    def __init__(
+        self,
+        mutual_information: Sequence[
+            Tensor | Sequence[Sequence[float]]
+        ],
+        dim: int = 1,
+        cond_dim: int | None = None,
+        context_separation: float = 1.0,
+        context_std: float = 1.0,
+        num_samples: int = 10_000,
+    ) -> None:
+        if len(mutual_information) != 2:
+            raise ValueError("mutual_information must contain two matrices")
+        if cond_dim is None:
+            cond_dim = dim
+        if cond_dim <= 0:
+            raise ValueError("cond_dim must be positive")
+        if context_separation < 0:
+            raise ValueError("context_separation must be nonnegative")
+        if context_std <= 0:
+            raise ValueError("context_std must be positive")
+
+        self.components = tuple(
+            PairwiseCorrelatedGaussian(matrix, dim, num_samples)
+            for matrix in mutual_information
+        )
+        if self.components[0].count != self.components[1].count:
+            raise ValueError("both MI matrices must have the same size")
+        self.mutual_information = torch.stack(
+            [component.mutual_information for component in self.components]
+        )
+        self.dim = dim
+        self.cond_dim = cond_dim
+        self.count = self.components[0].count
+        self.context_separation = context_separation
+        self.context_std = context_std
+        self.num_samples = num_samples
+
+    def __len__(self) -> int:
+        """Return the number of mixture samples."""
+        return self.num_samples
+
+    def __getitem__(self, index: int) -> TensorDict:
+        """Draw one Gaussian regime and its noisy conditioning vector."""
+        if not -self.num_samples <= index < self.num_samples:
+            raise IndexError("dataset index out of range")
+        regime = int(torch.randint(2, ()).item())
+        x = self.components[regime][index]["x"]
+        direction = 2 * regime - 1
+        context_mean = direction * self.context_separation / 2
+        cond = context_mean + self.context_std * torch.randn(self.cond_dim)
+        return TensorDict(
+            {
+                "x": x,
+                "cond": cond,
+                "regime": torch.tensor(regime, dtype=torch.long),
+            },
+            batch_size=[],
+        )
+
+
 class LatentPairwiseCorrelatedGaussian(Dataset[TensorDict]):
     r"""Batched pairwise Gaussian data with covariance-preserving contexts.
 
@@ -447,9 +533,148 @@ class LatentPairwiseCorrelatedGaussian(Dataset[TensorDict]):
         return float(denominator.reciprocal().item())
 
 
+class MixtureLatentPairwiseCorrelatedGaussian(Dataset[TensorDict]):
+    """Two latent Gaussian regimes with correlated conditioning bags.
+
+    Every dataset item randomly selects one of two
+    :class:`LatentPairwiseCorrelatedGaussian` components. For each observation,
+    the component's latent ``z`` is shared across a bag of stochastic context
+    tokens. The regime adds an opposing mean offset, while small independent
+    token noise prevents the bag from degenerating into repeated values.
+
+    Parameters
+    ----------
+    count : int
+        Number of latent components available to each regime.
+    batch_size : int
+        Number of observations in each generated batch.
+    mutual_information : Sequence[Tensor or Sequence[Sequence[float]]]
+        Exactly two pairwise MI matrices.
+    dim : int, default=1
+        Feature dimension of observations and conditioning tokens.
+    context_count : int, default=8
+        Number of stochastic latent tokens per observation.
+    regime_separation : float, default=4.0
+        Euclidean separation between the two context-distribution means.
+    context_noise_std : float, default=0.1
+        Independent token-noise standard deviation.
+    context_keep_probability : float, default=0.8
+        Probability that each context token is marked valid. At least one token
+        is always retained per observation.
+    num_batches : int, default=10000
+        Number of complete batches exposed by the dataset.
+    context_fraction : float, default=0.05
+        Shared latent covariance fraction used by both Gaussian components.
+    """
+
+    def __init__(
+        self,
+        count: int,
+        batch_size: int,
+        mutual_information: Sequence[
+            Tensor | Sequence[Sequence[float]]
+        ],
+        dim: int = 1,
+        context_count: int = 8,
+        regime_separation: float = 4.0,
+        context_noise_std: float = 0.1,
+        context_keep_probability: float = 0.8,
+        num_batches: int = 10_000,
+        context_fraction: float = 0.05,
+    ) -> None:
+        if len(mutual_information) != 2:
+            raise ValueError("mutual_information must contain two matrices")
+        if context_count <= 0:
+            raise ValueError("context_count must be positive")
+        if regime_separation < 0:
+            raise ValueError("regime_separation must be nonnegative")
+        if context_noise_std < 0:
+            raise ValueError("context_noise_std must be nonnegative")
+        if not 0 < context_keep_probability <= 1:
+            raise ValueError(
+                "context_keep_probability must be in the interval (0, 1]"
+            )
+
+        self.components = tuple(
+            LatentPairwiseCorrelatedGaussian(
+                count=count,
+                batch_size=batch_size,
+                mutual_information=matrix,
+                dim=dim,
+                num_batches=num_batches,
+                context_fraction=context_fraction,
+            )
+            for matrix in mutual_information
+        )
+        if self.components[0].variable_count != self.components[1].variable_count:
+            raise ValueError("both MI matrices must have the same size")
+        self.mutual_information = torch.stack(
+            [component.mutual_information for component in self.components]
+        )
+        self.conditional_mutual_information = torch.stack(
+            [
+                component.conditional_mutual_information
+                for component in self.components
+            ]
+        )
+        self.count = count
+        self.batch_size = batch_size
+        self.dim = dim
+        self.context_count = context_count
+        self.variable_count = self.components[0].variable_count
+        self.regime_separation = regime_separation
+        self.context_noise_std = context_noise_std
+        self.context_keep_probability = context_keep_probability
+        self.num_batches = num_batches
+        self.context_fraction = context_fraction
+
+    def __len__(self) -> int:
+        """Return the number of complete mixed-regime batches."""
+        return self.num_batches
+
+    def __getitem__(self, index: int) -> TensorDict:
+        """Draw one regime and create its correlated latent-token bags."""
+        if not -self.num_batches <= index < self.num_batches:
+            raise IndexError("dataset index out of range")
+        regime = int(torch.randint(2, ()).item())
+        component_batch = self.components[regime][index]
+        z = component_batch["z"]
+        direction = 2 * regime - 1
+        coordinate_offset = self.regime_separation / (2 * math.sqrt(self.dim))
+        context_mean = direction * coordinate_offset
+        noise = self.context_noise_std * torch.randn(
+            self.batch_size,
+            self.context_count,
+            self.dim,
+            dtype=z.dtype,
+        )
+        context = z.unsqueeze(1) + context_mean + noise
+        context_mask = torch.rand(
+            self.batch_size,
+            self.context_count,
+        ) < self.context_keep_probability
+        missing = ~context_mask.any(dim=-1)
+        context_mask[missing, 0] = True
+        return TensorDict(
+            {
+                "x": component_batch["x"],
+                "context": context,
+                "context_mask": context_mask,
+                "regime": torch.full(
+                    (self.batch_size,),
+                    regime,
+                    dtype=torch.long,
+                ),
+            },
+            batch_size=[self.batch_size],
+        )
+
+
 __all__ = [
+    "ConditionedPairwiseCorrelatedGaussian",
     "CorrelatedGausian",
     "LatentPairwiseCorrelatedGaussian",
+    "MixtureLatentPairwiseCorrelatedGaussian",
     "PairwiseCorrelatedGaussian",
     "tensordict_collate",
     "tensordict_passthrough",

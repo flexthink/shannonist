@@ -11,6 +11,7 @@ from torch import Tensor, nn
 
 from shannonist.framework import ObjectiveOutput, TrainableEstimator
 from shannonist.mi.types import MIBatch, MIEstimate, PairwiseMIBatch
+from shannonist.models.cond import Conditioning, make_conditioning
 from shannonist.models.flow import FlowDensityEstimator, Invertible, InvertibleMLP
 from shannonist.models.mlp import MultiMLP
 
@@ -31,13 +32,19 @@ class Proposal(nn.Module, ABC):
         self.dim = dim
 
     @abstractmethod
-    def forward(self, condition: Tensor) -> TensorDict:
+    def forward(
+        self,
+        condition: Tensor,
+        cond: Tensor | None = None,
+    ) -> TensorDict:
         """Compute distribution parameters conditioned on an input.
 
         Parameters
         ----------
         condition : Tensor
             Values conditioning the proposal distribution.
+        cond : Tensor, optional
+            Additional context for proposals that support conditioning.
 
         Returns
         -------
@@ -50,6 +57,7 @@ class Proposal(nn.Module, ABC):
         self,
         x: Tensor,
         params: TensorDict | None = None,
+        cond: Tensor | None = None,
     ) -> Tensor:
         """Evaluate the proposal density at arbitrary values.
 
@@ -69,13 +77,14 @@ class Proposal(nn.Module, ABC):
         Tensor
             Probability density for each value in ``x``.
         """
-        return self.log_prob(x, params).exp()
+        return self.log_prob(x, params, cond=cond).exp()
 
     @abstractmethod
     def log_prob(
         self,
         x: Tensor,
         params: TensorDict | None = None,
+        cond: Tensor | None = None,
     ) -> Tensor:
         """Evaluate the proposal log-density at arbitrary values.
 
@@ -86,6 +95,8 @@ class Proposal(nn.Module, ABC):
         params : TensorDict, optional
             Proposal-specific parameters returned by :meth:`forward`. If
             omitted, they are computed by passing ``x`` to :meth:`forward`.
+        cond : Tensor, optional
+            Additional context for proposals that support conditioning.
 
         Returns
         -------
@@ -111,13 +122,19 @@ class EntropyEstimator(nn.Module, ABC):
         self.dim = dim
 
     @abstractmethod
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> Tensor:
         """Estimate entropy for latent observations.
 
         Parameters
         ----------
         x : Tensor
             Latent observations with shape ``(*, dim)``.
+        cond : Tensor, optional
+            Additional context for estimators that support conditioning.
 
         Returns
         -------
@@ -155,7 +172,11 @@ class StandardNormalEntropyEstimator(EntropyEstimator):
     empirical distribution of its input.
     """
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> Tensor:
         """Return standard-normal entropy for every latent observation.
 
         Parameters
@@ -257,7 +278,11 @@ class GaussianEntropyEstimator(EntropyEstimator):
         self.mean.zero_()
         self.m2.zero_()
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> Tensor:
         """Update the fit when training and return its entropy.
 
         Parameters
@@ -319,7 +344,11 @@ class FlowEntropyEstimator(EntropyEstimator):
         super().__init__(dim)
         self.density_estimator = density_estimator
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> Tensor:
         """Return negative flow log-density for each observation.
 
         Parameters
@@ -339,7 +368,7 @@ class FlowEntropyEstimator(EntropyEstimator):
         """
         if x.ndim == 0 or x.shape[-1] != self.dim:
             raise ValueError(f"x must have trailing dimension {self.dim}")
-        return -self.density_estimator.log_prob(x.detach())
+        return -self.density_estimator.log_prob(x.detach(), cond=cond)
 
     def compute_objectives(self, predictions: Tensor) -> ObjectiveOutput:
         """Compute the mean negative log-likelihood of observed samples.
@@ -368,18 +397,19 @@ class FlowEntropyEstimator(EntropyEstimator):
 
 
 class FlowProposal(Proposal):
-    r"""Flow proposal for the pairwise conditional density ``q(x | y)``.
+    r"""Flow proposal for the conditional density ``q(x | y, c)``.
 
     Given paired variables ``x`` and ``y`` and a flow density ``p_flow``, this
     proposal uses the location-family model
 
     .. math::
 
-        q(x \mid y) = p_{\mathrm{flow}}(x - \mu_\theta(y)).
+        q(x \mid y, c) = p_{\mathrm{flow}}(x - \mu_\theta(y) \mid c).
 
     The location model defaults to a linear projection and the wrapped flow
-    learns the distribution of pairwise residuals. There is no additional
-    conditioning variable.
+    learns the distribution of pairwise residuals. The optional ``cond`` is
+    passed only to the flow, keeping it distinct from the proposal input
+    ``y``.
 
     Parameters
     ----------
@@ -415,7 +445,11 @@ class FlowProposal(Proposal):
             raise TypeError("location_model must be an nn.Module")
         self.location_model = location_model
 
-    def forward(self, y: Tensor) -> TensorDict:
+    def forward(
+        self,
+        y: Tensor,
+        cond: Tensor | None = None,
+    ) -> TensorDict:
         """Return parameters for the proposal ``q(x | y)``.
 
         Parameters
@@ -423,6 +457,9 @@ class FlowProposal(Proposal):
         y : Tensor
             Values of the conditioning random variable with shape
             ``(*, dim)``.
+        cond : Tensor, optional
+            Additional flow context. It is kept separate from ``y`` and does
+            not affect the location model.
 
         Returns
         -------
@@ -446,6 +483,7 @@ class FlowProposal(Proposal):
         self,
         x: Tensor,
         params: TensorDict | None = None,
+        cond: Tensor | None = None,
     ) -> Tensor:
         """Evaluate the conditional flow log-density.
 
@@ -465,10 +503,10 @@ class FlowProposal(Proposal):
         """
         self._validate_input(x, "x")
         if params is None:
-            params = self(x)
+            params = self(x, cond=cond)
         location = params["location"]
         self._validate_input(location, "location")
-        return self.density_estimator.log_prob(x - location)
+        return self.density_estimator.log_prob(x - location, cond=cond)
 
     def _validate_input(self, x: Tensor, name: str) -> None:
         """Validate a proposal value tensor."""
@@ -523,7 +561,11 @@ class GaussianProposal(Proposal):
         nn.init.zeros_(self.logvar.weight)
         nn.init.zeros_(self.logvar.bias)
 
-    def forward(self, condition: Tensor) -> TensorDict:
+    def forward(
+        self,
+        condition: Tensor,
+        cond: Tensor | None = None,
+    ) -> TensorDict:
         """Compute Gaussian parameters for a conditioning value.
 
         Parameters
@@ -551,6 +593,7 @@ class GaussianProposal(Proposal):
         self,
         x: Tensor,
         params: TensorDict | None = None,
+        cond: Tensor | None = None,
     ) -> Tensor:
         """Evaluate the diagonal Gaussian log-density at arbitrary values.
 
@@ -579,7 +622,7 @@ class GaussianProposal(Proposal):
             raise ValueError(f"x must have trailing dimension {self.dim}")
 
         if params is None:
-            params = self(x)
+            params = self(x, cond=cond)
         assert params is not None
         mu = params["mu"]
         logvar = params["logvar"]
@@ -605,8 +648,9 @@ def make_entropy_estimator(
         Feature dimension of latent observations.
     opts : Mapping[str, Any], optional
         Constructor options. For ``"flow"``, ``transform``, ``prior``, and
-        ``hidden_dims`` are recognized. The default transform is an
-        :class:`InvertibleMLP` with one hidden layer of width ``dim``.
+        ``hidden_dims``, and ``use_conditioning`` are recognized. The default
+        transform is an :class:`InvertibleMLP` with one hidden layer of width
+        ``dim``.
 
     Returns
     -------
@@ -645,8 +689,9 @@ def make_proposal(
         Feature dimension of proposal values.
     opts : Mapping[str, Any], optional
         Constructor options. For ``"flow"``, ``transform``, ``prior``, and
-        ``hidden_dims`` are recognized. The default transform is an
-        :class:`InvertibleMLP` with one hidden layer of width ``dim``.
+        ``hidden_dims``, and ``use_conditioning`` are recognized. The default
+        transform is an :class:`InvertibleMLP` with one hidden layer of width
+        ``dim``.
 
     Returns
     -------
@@ -689,6 +734,7 @@ def _make_flow_density_estimator(
     transform = options.pop("transform", None)
     prior = options.pop("prior", None)
     hidden_dims = options.pop("hidden_dims", (dim,))
+    use_conditioning = options.pop("use_conditioning", False)
     if options:
         unexpected = ", ".join(sorted(options))
         raise ValueError(f"unknown flow options: {unexpected}")
@@ -697,10 +743,45 @@ def _make_flow_density_estimator(
             input_dim=dim,
             hidden_dims=hidden_dims,
             output_dim=dim,
+            use_conditioning=use_conditioning,
         )
     if not isinstance(transform, Invertible):
         raise TypeError("transform must be an Invertible")
     return FlowDensityEstimator(transform=transform, prior=prior)
+
+
+def _resolve_conditioning(
+    conditioning: Conditioning | str | None,
+    dim: int,
+    opts: Mapping[str, Any] | None,
+) -> Conditioning | None:
+    """Resolve an optional conditioning module or factory name."""
+    if conditioning is None:
+        if opts:
+            raise ValueError("conditioning_opts require conditioning")
+        return None
+    if isinstance(conditioning, str):
+        return make_conditioning(conditioning, dim, opts)
+    if opts:
+        raise ValueError("conditioning_opts require conditioning to be a string")
+    if not isinstance(conditioning, Conditioning):
+        raise TypeError("conditioning must implement Conditioning")
+    return conditioning
+
+
+def _prepare_conditioning(
+    conditioning: Conditioning | None,
+    cond: Tensor | None,
+    cond_mask: Tensor | None,
+) -> Tensor | None:
+    """Apply optional conditioning preprocessing to a batch context."""
+    if cond is None:
+        if cond_mask is not None:
+            raise ValueError("cond_mask requires cond")
+        return None
+    if conditioning is None:
+        return cond
+    return conditioning(cond, cond_mask)
 
 
 class JointBAOutput(TensorClass):
@@ -804,6 +885,10 @@ class JointBA(
     proposal_opts : Mapping[str, Any], optional
         Options passed to :func:`make_proposal` when ``conditional_proposal``
         is a string.
+    conditioning : Conditioning or str, optional
+        Optional conditioning preprocessor instance or factory name.
+    conditioning_opts : Mapping[str, Any], optional
+        Options passed to :func:`make_conditioning`.
 
     Raises
     ------
@@ -824,6 +909,8 @@ class JointBA(
         encoder: nn.Module | None = None,
         estimator_opts: Mapping[str, Any] | None = None,
         proposal_opts: Mapping[str, Any] | None = None,
+        conditioning: Conditioning | str | None = None,
+        conditioning_opts: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -873,6 +960,11 @@ class JointBA(
         self.encoder = encoder if encoder is not None else nn.Linear(dim, enc_dim)
         self.conditional_proposal = conditional_proposal
         self.entropy_estimator = entropy_estimator
+        self.conditioning = _resolve_conditioning(
+            conditioning,
+            enc_dim,
+            conditioning_opts,
+        )
 
     def compute_forward(self, batch: MIBatch) -> JointBAOutput:
         """Encode paired inputs and evaluate entropy and conditional density.
@@ -897,12 +989,18 @@ class JointBA(
 
         hx = self.encoder(batch.x)
         hy = self.encoder(batch.y)
-        conditional_params = self.conditional_proposal(hy)
+        cond = _prepare_conditioning(
+            self.conditioning,
+            batch.cond,
+            batch.cond_mask,
+        )
+        conditional_params = self.conditional_proposal(hy, cond=cond)
         conditional_log_prob = self.conditional_proposal.log_prob(
             hx,
             conditional_params,
+            cond=cond,
         )
-        entropy = self.entropy_estimator(hx)
+        entropy = self.entropy_estimator(hx, cond=cond)
         return JointBAOutput(
             hx=hx,
             hy=hy,
@@ -1122,6 +1220,10 @@ class PairwiseBA(
         Options passed to :func:`make_entropy_estimator`.
     proposal_opts : Mapping[str, Any], optional
         Options passed to :func:`make_proposal`.
+    conditioning : Conditioning or str, optional
+        Optional conditioning preprocessor instance or factory name.
+    conditioning_opts : Mapping[str, Any], optional
+        Options passed to :func:`make_conditioning`.
     """
 
     def __init__(
@@ -1134,6 +1236,8 @@ class PairwiseBA(
         encoder: nn.Module | None = None,
         estimator_opts: Mapping[str, Any] | None = None,
         proposal_opts: Mapping[str, Any] | None = None,
+        conditioning: Conditioning | str | None = None,
+        conditioning_opts: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -1191,6 +1295,11 @@ class PairwiseBA(
         )
         self.conditional_proposal = conditional_proposal
         self.entropy_estimator = entropy_estimator
+        self.conditioning = _resolve_conditioning(
+            conditioning,
+            enc_dim,
+            conditioning_opts,
+        )
 
     def compute_forward(self, batch: PairwiseMIBatch) -> PairwiseBAOutput:
         """Encode observations and evaluate every directed BA proposal.
@@ -1233,13 +1342,38 @@ class PairwiseBA(
             self.enc_dim,
         )
         target = hx.unsqueeze(-2).expand_as(condition)
-        conditional_params = self.conditional_proposal(condition)
+        raw_cond = _prepare_conditioning(
+            self.conditioning,
+            batch.cond,
+            batch.cond_mask,
+        )
+        cond = self._expand_condition(raw_cond, hx)
+        pair_cond = None
+        if cond is not None:
+            pair_cond = cond.unsqueeze(-2).unsqueeze(-2).expand(
+                *hx.shape[:-2],
+                self.count,
+                self.count,
+                cond.shape[-1],
+            )
+        conditional_params = self.conditional_proposal(
+            condition,
+            cond=pair_cond,
+        )
         conditional_log_prob = self.conditional_proposal.log_prob(
             target,
             conditional_params,
+            cond=pair_cond,
         )
 
-        valid_entropy = self.entropy_estimator(hx[mask])
+        entropy_cond = None
+        if cond is not None:
+            entropy_cond = cond.unsqueeze(-2).expand(
+                *hx.shape[:-2],
+                self.count,
+                cond.shape[-1],
+            )[mask]
+        valid_entropy = self.entropy_estimator(hx[mask], cond=entropy_cond)
         entropy = hx.new_zeros(mask.shape)
         entropy[mask] = valid_entropy
         return PairwiseBAOutput(
@@ -1263,6 +1397,22 @@ class PairwiseBA(
                 "x_mask must have shape (*, count) or (*, count, 1)"
             )
         return mask.to(device=x.device, dtype=torch.bool)
+
+    @staticmethod
+    def _expand_condition(cond: Tensor | None, x: Tensor) -> Tensor | None:
+        """Broadcast sample-level context across leading batch dimensions."""
+        if cond is None:
+            return None
+        if cond.ndim == 0:
+            raise ValueError("cond must have a trailing feature dimension")
+        leading_shape = x.shape[:-2]
+        broadcast_shape = torch.broadcast_shapes(
+            leading_shape,
+            cond.shape[:-1],
+        )
+        if broadcast_shape != leading_shape:
+            raise ValueError("cond batch dimensions must broadcast to x")
+        return cond.expand(*leading_shape, cond.shape[-1])
 
     def compute_objectives(
         self,
@@ -1438,6 +1588,10 @@ class SampledPairwiseBA(
         Options passed to :func:`make_entropy_estimator`.
     proposal_opts : Mapping[str, Any], optional
         Options passed to :func:`make_proposal`.
+    conditioning : Conditioning or str, optional
+        Optional conditioning preprocessor instance or factory name.
+    conditioning_opts : Mapping[str, Any], optional
+        Options passed to :func:`make_conditioning`.
     """
 
     def __init__(
@@ -1450,6 +1604,8 @@ class SampledPairwiseBA(
         encoder: nn.Module | None = None,
         estimator_opts: Mapping[str, Any] | None = None,
         proposal_opts: Mapping[str, Any] | None = None,
+        conditioning: Conditioning | str | None = None,
+        conditioning_opts: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__()
         if dim <= 0:
@@ -1502,6 +1658,11 @@ class SampledPairwiseBA(
         self.encoder = encoder if encoder is not None else nn.Linear(dim, enc_dim)
         self.conditional_proposal = conditional_proposal
         self.entropy_estimator = entropy_estimator
+        self.conditioning = _resolve_conditioning(
+            conditioning,
+            enc_dim,
+            conditioning_opts,
+        )
 
     def compute_forward(
         self,
@@ -1558,12 +1719,31 @@ class SampledPairwiseBA(
 
         target = hx
         condition = hx.flip(dims=(-2,))
-        conditional_params = self.conditional_proposal(condition)
+        raw_cond = _prepare_conditioning(
+            self.conditioning,
+            batch.cond,
+            batch.cond_mask,
+        )
+        cond = PairwiseBA._expand_condition(raw_cond, batch.x)
+        pair_cond = None
+        if cond is not None:
+            cond = cond.reshape(batch_size, cond.shape[-1])
+            pair_cond = cond[:, None, None, :].expand(
+                batch_size,
+                num_samples,
+                2,
+                cond.shape[-1],
+            )
+        conditional_params = self.conditional_proposal(
+            condition,
+            cond=pair_cond,
+        )
         conditional_log_prob = self.conditional_proposal.log_prob(
             target,
             conditional_params,
+            cond=pair_cond,
         )
-        entropy = self.entropy_estimator(hx)
+        entropy = self.entropy_estimator(hx, cond=pair_cond)
         return SampledPairwiseBAOutput(
             hx=hx,
             conditional_log_prob=conditional_log_prob,
@@ -1717,6 +1897,12 @@ class SampledPairwiseBA(
                 f"expected feature dimension {self.dim}, got {feature_dim}"
             )
         mask = self._normalize_mask(batch.x_mask, x)
+        raw_cond = _prepare_conditioning(
+            self.conditioning,
+            batch.cond,
+            batch.cond_mask,
+        )
+        cond = PairwiseBA._expand_condition(raw_cond, x)
         hx = x.new_zeros(batch_size, count, self.enc_dim)
         if mask.any():
             encoded = self.encoder(x[mask])
@@ -1729,7 +1915,17 @@ class SampledPairwiseBA(
 
         entropy = hx.new_zeros(batch_size, count)
         if mask.any():
-            entropy[mask] = self.entropy_estimator(hx[mask])
+            entropy_cond = None
+            if cond is not None:
+                entropy_cond = cond.unsqueeze(-2).expand(
+                    batch_size,
+                    count,
+                    cond.shape[-1],
+                )[mask]
+            entropy[mask] = self.entropy_estimator(
+                hx[mask],
+                cond=entropy_cond,
+            )
 
         estimate_matrix = hx.new_zeros(batch_size, count, count)
         for left_start in range(0, count, chunk_size):
@@ -1755,17 +1951,33 @@ class SampledPairwiseBA(
                     self.enc_dim,
                 )
                 right_values = right.unsqueeze(-3).expand_as(left_values)
+                block_cond = None
+                if cond is not None:
+                    block_cond = cond[:, None, None, :].expand(
+                        batch_size,
+                        left_count,
+                        right_count,
+                        cond.shape[-1],
+                    )
 
-                left_params = self.conditional_proposal(right_values)
+                left_params = self.conditional_proposal(
+                    right_values,
+                    cond=block_cond,
+                )
                 left_log_prob = self.conditional_proposal.log_prob(
                     left_values,
                     left_params,
+                    cond=block_cond,
                 )
                 del left_params
-                right_params = self.conditional_proposal(left_values)
+                right_params = self.conditional_proposal(
+                    left_values,
+                    cond=block_cond,
+                )
                 right_log_prob = self.conditional_proposal.log_prob(
                     right_values,
                     right_params,
+                    cond=block_cond,
                 )
                 del right_params
                 if not torch.all(torch.isfinite(left_log_prob[block_valid])):
@@ -1830,6 +2042,7 @@ __all__ = [
     "Proposal",
     "StandardNormalEntropyEstimator",
     "make_entropy_estimator",
+    "make_conditioning",
     "make_proposal",
     "joint_ba_loss",
     "pairwise_ba_loss",

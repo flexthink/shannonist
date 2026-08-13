@@ -1,0 +1,97 @@
+seed: 1337
+
+# Two distinct MI structures. The second is a permutation of the first, which
+# preserves positive semidefiniteness while requiring regime discrimination.
+mutual_information:
+    -
+        - [0.0, 0.30, 0.12, 0.05, 0.18]
+        - [0.30, 0.0, 0.22, 0.08, 0.14]
+        - [0.12, 0.22, 0.0, 0.27, 0.10]
+        - [0.05, 0.08, 0.27, 0.0, 0.20]
+        - [0.18, 0.14, 0.10, 0.20, 0.0]
+    -
+        - [0.0, 0.20, 0.10, 0.14, 0.18]
+        - [0.20, 0.0, 0.27, 0.08, 0.05]
+        - [0.10, 0.27, 0.0, 0.22, 0.12]
+        - [0.14, 0.08, 0.22, 0.0, 0.30]
+        - [0.18, 0.05, 0.12, 0.30, 0.0]
+sequence_length: 5
+latent_count: 10
+dim: 20
+context_count: 8
+context_fraction: 0.05
+
+# The regime means are six standard deviations apart along a shared unit
+# direction. Token noise is small relative to the sample-specific latent z.
+regime_separation: 6.0
+context_noise_std: 0.1
+context_keep_probability: 0.8
+
+batch_size: 8
+train_batches: 4096
+valid_batches: 512
+number_of_epochs: 20
+lr: 0.0001
+
+sample_size: 5
+enc_dim: !ref <dim>
+proposal_opts:
+    use_conditioning: True
+estimator_opts:
+    use_conditioning: True
+
+train_set: !new:shannonist.mi.MixtureLatentPairwiseCorrelatedGaussian
+    count: !ref <latent_count>
+    batch_size: !ref <batch_size>
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    context_count: !ref <context_count>
+    regime_separation: !ref <regime_separation>
+    context_noise_std: !ref <context_noise_std>
+    context_keep_probability: !ref <context_keep_probability>
+    num_batches: !ref <train_batches>
+    context_fraction: !ref <context_fraction>
+
+valid_set: !new:shannonist.mi.MixtureLatentPairwiseCorrelatedGaussian
+    count: !ref <latent_count>
+    batch_size: !ref <batch_size>
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    context_count: !ref <context_count>
+    regime_separation: !ref <regime_separation>
+    context_noise_std: !ref <context_noise_std>
+    context_keep_probability: !ref <context_keep_probability>
+    num_batches: !ref <valid_batches>
+    context_fraction: !ref <context_fraction>
+
+conditioning: attention_pooling
+conditioning_opts: {}
+
+encoder: !new:torch.nn.Identity
+
+estimator: !new:shannonist.mi.SampledPairwiseBA
+    dim: !ref <dim>
+    enc_dim: !ref <enc_dim>
+    sample_size: !ref <sample_size>
+    encoder: !ref <encoder>
+    conditional_proposal: flow
+    entropy_estimator: flow
+    proposal_opts: !ref <proposal_opts>
+    estimator_opts: !ref <estimator_opts>
+    conditioning: !ref <conditioning>
+    conditioning_opts: !ref <conditioning_opts>
+
+optimizer: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+train_loader_kwargs:
+    batch_size: null
+    shuffle: True
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_passthrough
+
+valid_loader_kwargs:
+    batch_size: null
+    shuffle: False
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_passthrough

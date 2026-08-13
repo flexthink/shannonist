@@ -43,7 +43,11 @@ class ConstantDensityProposal(Proposal):
         super().__init__(dim)
         self.density = density
 
-    def forward(self, condition: torch.Tensor) -> TensorDict:
+    def forward(
+        self,
+        condition: torch.Tensor,
+        cond: torch.Tensor | None = None,
+    ) -> TensorDict:
         density = condition.new_full(condition.shape[:-1], self.density)
         return TensorDict({"density": density}, batch_size=condition.shape[:-1])
 
@@ -51,9 +55,10 @@ class ConstantDensityProposal(Proposal):
         self,
         x: torch.Tensor,
         params: TensorDict | None = None,
+        cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if params is None:
-            params = self(x)
+            params = self(x, cond=cond)
         return params["density"].log()
 
 
@@ -64,9 +69,13 @@ class RecordingDensityProposal(ConstantDensityProposal):
         super().__init__(dim, density)
         self.condition_shapes: list[torch.Size] = []
 
-    def forward(self, condition: torch.Tensor) -> TensorDict:
+    def forward(
+        self,
+        condition: torch.Tensor,
+        cond: torch.Tensor | None = None,
+    ) -> TensorDict:
         self.condition_shapes.append(condition.shape)
-        return super().forward(condition)
+        return super().forward(condition, cond=cond)
 
 
 class ConstantEntropyEstimator(EntropyEstimator):
@@ -76,7 +85,11 @@ class ConstantEntropyEstimator(EntropyEstimator):
         super().__init__(dim)
         self.entropy = nn.Parameter(torch.tensor(entropy))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         return x.new_ones(x.shape[:-1]) * self.entropy
 
 
@@ -612,6 +625,52 @@ def test_joint_ba_objective_backpropagates() -> None:
     assert entropy_estimator.entropy.grad is None
 
 
+def test_joint_ba_conditions_flow_proposal_and_entropy() -> None:
+    estimator = JointBA(
+        dim=2,
+        enc_dim=2,
+        encoder=nn.Identity(),
+        conditional_proposal="flow",
+        entropy_estimator="flow",
+        proposal_opts={"use_conditioning": True},
+        estimator_opts={"use_conditioning": True},
+    )
+    batch = MIBatch(
+        x=torch.randn(4, 2),
+        y=torch.randn(4, 2),
+        cond=torch.randn(4, 2),
+        batch_size=[4],
+    )
+
+    predictions = estimator.compute_forward(batch)
+
+    assert predictions.conditional_log_prob.shape == (4,)
+    assert predictions.entropy.shape == (4,)
+
+
+def test_pairwise_ba_broadcasts_context_across_pairs() -> None:
+    estimator = PairwiseBA(
+        dim=2,
+        enc_dim=2,
+        count=3,
+        encoder=nn.Identity(),
+        conditional_proposal="flow",
+        entropy_estimator="flow",
+        proposal_opts={"use_conditioning": True},
+        estimator_opts={"use_conditioning": True},
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(4, 3, 2),
+        cond=torch.randn(4, 2),
+        batch_size=[4],
+    )
+
+    predictions = estimator.compute_forward(batch)
+
+    assert predictions.conditional_log_prob.shape == (4, 3, 3)
+    assert predictions.entropy.shape == (4, 3)
+
+
 def test_joint_ba_rejects_masks() -> None:
     estimator = JointBA(dim=2, enc_dim=2)
     batch = MIBatch(
@@ -948,6 +1007,69 @@ def test_sampled_pairwise_ba_loss_averages_directions_and_samples() -> None:
         expected_vec.mean(dim=0),
     )
     assert torch.allclose(loss, -expected_vec.mean())
+
+
+def test_sampled_pairwise_ba_conditions_sampled_and_full_modes() -> None:
+    estimator = SampledPairwiseBA(
+        dim=2,
+        enc_dim=2,
+        sample_size=2,
+        encoder=nn.Identity(),
+        conditional_proposal="flow",
+        entropy_estimator="flow",
+        proposal_opts={"use_conditioning": True},
+        estimator_opts={"use_conditioning": True},
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(3, 4, 2),
+        cond=torch.randn(3, 2),
+        batch_size=[3],
+    )
+
+    sampled = estimator.estimate(batch)
+    full = estimator.estimate(batch, {"mode": "full", "chunk_size": 2})
+
+    assert sampled.value.ndim == 0
+    assert full.value.shape == (3, 4, 4)
+    assert full.entropies is not None
+    assert full.entropies.shape == (3, 4)
+
+
+def test_sampled_pairwise_ba_builds_attention_conditioning() -> None:
+    estimator = SampledPairwiseBA(
+        dim=2,
+        enc_dim=2,
+        sample_size=2,
+        encoder=nn.Identity(),
+        conditional_proposal="flow",
+        entropy_estimator="flow",
+        proposal_opts={"use_conditioning": True},
+        estimator_opts={"use_conditioning": True},
+        conditioning="attention_pooling",
+        conditioning_opts={"bias": False},
+    )
+    batch = PairwiseMIBatch(
+        x=torch.randn(3, 4, 2),
+        cond=torch.randn(3, 5, 2),
+        cond_mask=torch.tensor(
+            [
+                [1, 1, 1, 0, 0],
+                [1, 1, 0, 0, 0],
+                [1, 1, 1, 1, 1],
+            ]
+        ),
+        batch_size=[3],
+    )
+
+    predictions = estimator.compute_forward(batch)
+
+    assert predictions.conditional_log_prob.shape == (3, 2, 2)
+    assert predictions.entropy.shape == (3, 2, 2)
+
+
+def test_ba_conditioning_options_require_factory_name() -> None:
+    with pytest.raises(ValueError, match="conditioning_opts require"):
+        JointBA(dim=2, enc_dim=2, conditioning_opts={"bias": False})
 
 
 def test_sampled_pairwise_ba_default_modules_and_gradients() -> None:

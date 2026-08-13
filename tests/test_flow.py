@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from shannonist.models import (
+    ConditionedInvertibleLinearLayer,
     FlowDensityEstimator,
     Invertible,
     InvertibleLeakyReLU,
@@ -16,7 +17,11 @@ from shannonist.models import (
 
 def test_invertible_requires_an_inverse() -> None:
     class ForwardOnly(Invertible):
-        def forward(self, x: torch.Tensor) -> InvertibleOutput:
+        def forward(
+            self,
+            x: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
             return InvertibleOutput(
                 value=x,
                 log_abs_det=x.new_zeros(x.shape[:-1]),
@@ -29,14 +34,22 @@ def test_invertible_requires_an_inverse() -> None:
 
 def test_invertible_subclass_can_round_trip() -> None:
     class Shift(Invertible):
-        def forward(self, x: torch.Tensor) -> InvertibleOutput:
+        def forward(
+            self,
+            x: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
             return InvertibleOutput(
                 value=x + 1,
                 log_abs_det=x.new_zeros(x.shape[:-1]),
                 batch_size=x.shape[:-1],
             )
 
-        def inverse(self, y: torch.Tensor) -> InvertibleOutput:
+        def inverse(
+            self,
+            y: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
             return InvertibleOutput(
                 value=y - 1,
                 log_abs_det=y.new_zeros(y.shape[:-1]),
@@ -87,6 +100,20 @@ def test_invertible_linear_matches_linear_semantics() -> None:
 
     output = transform(x)
     assert torch.allclose(output.value, expected)
+
+
+def test_unconditional_invertible_ignores_conditioning() -> None:
+    transform = InvertibleLinear(dim=3)
+    x = torch.randn(5, 3)
+    cond = torch.randn(5, 7)
+
+    unconditional = transform(x)
+    conditional = transform(x, cond=cond)
+    reconstructed = transform.inverse(conditional.value, cond=cond)
+
+    assert torch.equal(conditional.value, unconditional.value)
+    assert torch.equal(conditional.log_abs_det, unconditional.log_abs_det)
+    assert torch.allclose(reconstructed.value, x, atol=1e-6)
 
 
 @pytest.mark.parametrize("bias", [True, False])
@@ -190,6 +217,102 @@ def test_invertible_linear_ignores_unused_triangle_parameters() -> None:
 
     assert torch.equal(transform.L(), torch.eye(3))
     assert torch.equal(transform.U(), torch.eye(3))
+
+
+def test_conditioned_invertible_linear_initializes_to_identity() -> None:
+    transform = ConditionedInvertibleLinearLayer(dim=3, cond_dim=2)
+    x = torch.randn(5, 3)
+    cond = torch.randn(5, 2)
+
+    output = transform(x, cond=cond)
+    reconstructed = transform.inverse(output.value, cond=cond)
+
+    assert torch.equal(output.value, x)
+    assert torch.equal(output.log_abs_det, torch.zeros(5))
+    assert torch.equal(reconstructed.value, x)
+
+
+def test_conditioned_invertible_linear_round_trip_and_log_det() -> None:
+    transform = ConditionedInvertibleLinearLayer(dim=3, cond_dim=2).double()
+    with torch.no_grad():
+        output_layer = transform.hypernetwork[-1]
+        assert isinstance(output_layer, nn.Linear)
+        output_layer.weight.normal_(std=0.1)
+        output_layer.bias.normal_(std=0.1)
+    x = torch.randn(2, 4, 3, dtype=torch.float64)
+    cond = torch.randn(2, 4, 2, dtype=torch.float64)
+
+    output = transform(x, cond=cond)
+    reconstructed = transform.inverse(output.value, cond=cond)
+
+    assert torch.allclose(reconstructed.value, x, atol=1e-10)
+    assert torch.allclose(
+        output.log_abs_det + reconstructed.log_abs_det,
+        torch.zeros_like(output.log_abs_det),
+        atol=1e-10,
+    )
+
+
+def test_conditioned_invertible_linear_log_det_matches_jacobian() -> None:
+    transform = ConditionedInvertibleLinearLayer(dim=3, cond_dim=2).double()
+    with torch.no_grad():
+        output_layer = transform.hypernetwork[-1]
+        assert isinstance(output_layer, nn.Linear)
+        output_layer.weight.normal_(std=0.1)
+        output_layer.bias.normal_(std=0.1)
+    x = torch.randn(3, dtype=torch.float64)
+    cond = torch.randn(2, dtype=torch.float64)
+
+    output = transform(x, cond=cond)
+    jacobian = torch.autograd.functional.jacobian(
+        lambda value: transform(value, cond=cond).value,
+        x,
+    )
+    _, expected = torch.linalg.slogdet(jacobian)
+
+    assert torch.allclose(output.log_abs_det, expected, atol=1e-10)
+
+
+def test_conditioned_invertible_linear_uses_conditioning() -> None:
+    transform = ConditionedInvertibleLinearLayer(dim=2, cond_dim=1)
+    with torch.no_grad():
+        input_layer = transform.hypernetwork[0]
+        output_layer = transform.hypernetwork[-1]
+        assert isinstance(input_layer, nn.Linear)
+        assert isinstance(output_layer, nn.Linear)
+        input_layer.weight.fill_(1.0)
+        output_layer.weight.fill_(0.25)
+    x = torch.ones(3, 2)
+
+    first = transform(x, cond=torch.zeros(3, 1))
+    second = transform(x, cond=torch.ones(3, 1))
+
+    assert not torch.equal(first.value, second.value)
+    assert not torch.equal(first.log_abs_det, second.log_abs_det)
+
+
+def test_conditioned_invertible_linear_broadcasts_conditioning() -> None:
+    transform = ConditionedInvertibleLinearLayer(dim=3, cond_dim=2)
+    x = torch.randn(4, 3)
+    cond = torch.randn(2)
+
+    output = transform(x, cond=cond)
+
+    assert output.value.shape == (4, 3)
+    assert output.log_abs_det.shape == (4,)
+
+
+def test_conditioned_invertible_linear_validates_inputs() -> None:
+    with pytest.raises(ValueError, match="dim"):
+        ConditionedInvertibleLinearLayer(dim=0, cond_dim=2)
+    with pytest.raises(ValueError, match="cond_dim"):
+        ConditionedInvertibleLinearLayer(dim=2, cond_dim=0)
+
+    transform = ConditionedInvertibleLinearLayer(dim=2, cond_dim=3)
+    with pytest.raises(ValueError, match="cond is required"):
+        transform(torch.randn(4, 2))
+    with pytest.raises(ValueError, match="cond.*trailing dimension"):
+        transform(torch.randn(4, 2), cond=torch.randn(4, 2))
 
 
 def test_invertible_mlp_round_trip() -> None:
@@ -314,6 +437,75 @@ def test_invertible_mlp_uses_activation_aware_hidden_gain() -> None:
     ]
 
 
+def test_invertible_mlp_propagates_conditioning() -> None:
+    class ConditionalShift(Invertible):
+        def forward(
+            self,
+            x: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
+            assert cond is not None
+            value = x + cond
+            return InvertibleOutput(
+                value=value,
+                log_abs_det=x.new_zeros(value.shape[:-1]),
+                batch_size=value.shape[:-1],
+            )
+
+        def inverse(
+            self,
+            y: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
+            assert cond is not None
+            return InvertibleOutput(
+                value=y - cond,
+                log_abs_det=y.new_zeros(y.shape[:-1]),
+                batch_size=y.shape[:-1],
+            )
+
+    transform = InvertibleMLP(3, (3,), 3, activation=ConditionalShift())
+    x = torch.randn(4, 3)
+    cond = torch.randn(4, 3)
+
+    output = transform(x, cond=cond)
+    reconstructed = transform.inverse(output.value, cond=cond)
+
+    assert torch.allclose(reconstructed.value, x, atol=1e-6)
+
+
+def test_invertible_mlp_can_use_conditioned_linear_layers() -> None:
+    transform = InvertibleMLP(
+        input_dim=3,
+        hidden_dims=(3,),
+        output_dim=3,
+        use_conditioning=True,
+    )
+    x = torch.randn(5, 3)
+    cond = torch.randn(5, 3)
+
+    output = transform(x, cond=cond)
+    reconstructed = transform.inverse(output.value, cond=cond)
+
+    assert transform.use_conditioning
+    assert all(
+        isinstance(layer, ConditionedInvertibleLinearLayer)
+        for layer in transform.layers
+    )
+    assert torch.allclose(reconstructed.value, x, atol=1e-6)
+    assert torch.allclose(
+        output.log_abs_det + reconstructed.log_abs_det,
+        torch.zeros_like(output.log_abs_det),
+    )
+
+
+def test_conditioned_invertible_mlp_requires_conditioning() -> None:
+    transform = InvertibleMLP(3, (3,), 3, use_conditioning=True)
+
+    with pytest.raises(ValueError, match="cond is required"):
+        transform(torch.randn(5, 3))
+
+
 def test_invertible_mlp_validates_dimensions() -> None:
     with pytest.raises(ValueError, match="positive"):
         InvertibleMLP(input_dim=0, hidden_dims=(), output_dim=0)
@@ -384,6 +576,52 @@ def test_flow_density_estimator_sample_and_evaluation_agree() -> None:
     assert torch.allclose(evaluated.log_abs_det, -sampled.log_abs_det)
 
 
+def test_flow_density_estimator_propagates_conditioning() -> None:
+    class ConditionalShift(Invertible):
+        dim = 2
+
+        def forward(
+            self,
+            x: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
+            assert cond is not None
+            value = x + cond
+            return InvertibleOutput(
+                value=value,
+                log_abs_det=x.new_zeros(value.shape[:-1]),
+                batch_size=value.shape[:-1],
+            )
+
+        def inverse(
+            self,
+            y: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
+            assert cond is not None
+            return InvertibleOutput(
+                value=y - cond,
+                log_abs_det=y.new_zeros(y.shape[:-1]),
+                batch_size=y.shape[:-1],
+            )
+
+    estimator = FlowDensityEstimator(ConditionalShift())
+    value = torch.randn(4, 2)
+    cond = torch.randn(4, 2)
+
+    output = estimator.evaluate(value, cond=cond)
+
+    assert torch.equal(output.latent, value - cond)
+    assert torch.equal(
+        estimator.log_prob(value, cond=cond),
+        output.log_prob,
+    )
+
+    sampled = estimator(cond=cond)
+    assert sampled.value.shape == sampled.latent.shape == (4, 2)
+    assert torch.equal(sampled.value, sampled.latent + cond)
+
+
 def test_flow_density_estimator_log_prob_is_differentiable() -> None:
     estimator = make_affine_flow_density()
     value = torch.randn(5, 2)
@@ -435,10 +673,18 @@ def test_default_flow_prior_follows_module_dtype() -> None:
 
 def test_default_flow_prior_requires_transform_dimension() -> None:
     class DimensionlessInvertible(Invertible):
-        def forward(self, x: torch.Tensor) -> InvertibleOutput:
+        def forward(
+            self,
+            x: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
             raise NotImplementedError
 
-        def inverse(self, y: torch.Tensor) -> InvertibleOutput:
+        def inverse(
+            self,
+            y: torch.Tensor,
+            cond: torch.Tensor | None = None,
+        ) -> InvertibleOutput:
             raise NotImplementedError
 
     with pytest.raises(ValueError, match="expose.*dim"):

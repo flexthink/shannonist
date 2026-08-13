@@ -1,0 +1,74 @@
+seed: 1337
+
+mutual_information:
+    - [0.0, 0.30, 0.12, 0.05, 0.18]
+    - [0.30, 0.0, 0.22, 0.08, 0.14]
+    - [0.12, 0.22, 0.0, 0.27, 0.10]
+    - [0.05, 0.08, 0.27, 0.0, 0.20]
+    - [0.18, 0.14, 0.10, 0.20, 0.0]
+sequence_length: 5
+latent_count: 10
+dim: 20
+
+# Every dataset item is a complete batch with one z per observation.
+batch_size: 8
+train_batches: 2048
+valid_batches: 256
+# Keep conditional MI comparable to the configured marginal matrix while
+# retaining a measurable shared contribution from z.
+context_fraction: 0.05
+
+number_of_epochs: 20
+lr: 0.0001
+
+sample_size: 5
+enc_dim: !ref <dim>
+conditional_proposal: flow
+entropy_estimator: flow
+proposal_opts:
+    use_conditioning: True
+estimator_opts:
+    use_conditioning: True
+
+train_set: !new:shannonist.mi.LatentPairwiseCorrelatedGaussian
+    count: !ref <latent_count>
+    batch_size: !ref <batch_size>
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_batches: !ref <train_batches>
+    context_fraction: !ref <context_fraction>
+
+valid_set: !new:shannonist.mi.LatentPairwiseCorrelatedGaussian
+    count: !ref <latent_count>
+    batch_size: !ref <batch_size>
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    num_batches: !ref <valid_batches>
+    context_fraction: !ref <context_fraction>
+
+encoder: !new:torch.nn.Identity
+
+estimator: !new:shannonist.mi.SampledPairwiseBA
+    dim: !ref <dim>
+    enc_dim: !ref <enc_dim>
+    sample_size: !ref <sample_size>
+    encoder: !ref <encoder>
+    conditional_proposal: !ref <conditional_proposal>
+    entropy_estimator: !ref <entropy_estimator>
+    proposal_opts: !ref <proposal_opts>
+    estimator_opts: !ref <estimator_opts>
+
+optimizer: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+train_loader_kwargs:
+    batch_size: null
+    shuffle: True
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_passthrough
+
+valid_loader_kwargs:
+    batch_size: null
+    shuffle: False
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_passthrough

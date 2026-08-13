@@ -15,6 +15,11 @@ class MIBatch(TensorClass):
         Observations of the first random variable.
     y : Tensor
         Corresponding observations of the second random variable.
+    cond : Tensor, optional
+        Additional context conditioning both the conditional density and the
+        entropy model.
+    cond_mask : Tensor, optional
+        Valid-position mask for structured conditioning inputs.
     x_mask : Tensor, optional
         Length mask for ``x``. Required only when the estimator needs to
         distinguish valid and padded positions.
@@ -25,6 +30,8 @@ class MIBatch(TensorClass):
 
     x: Tensor
     y: Tensor
+    cond: Tensor | None = None
+    cond_mask: Tensor | None = None
     x_mask: Tensor | None = None
     y_mask: Tensor | None = None
 
@@ -58,9 +65,15 @@ class PairwiseMIBatch(TensorClass):
     x_mask : Tensor, optional
         Valid-position mask with shape ``(batch, count)`` or
         ``(batch, count, 1)``. Nonzero values identify present observations.
+    cond : Tensor, optional
+        Additional context shared by all variable pairs in each sample.
+    cond_mask : Tensor, optional
+        Valid-position mask for structured conditioning inputs.
     """
 
     x: Tensor
+    cond: Tensor | None = None
+    cond_mask: Tensor | None = None
     x_mask: Tensor | None = None
 
 

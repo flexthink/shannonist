@@ -1,5 +1,11 @@
 """Neural network components for information-theoretic analysis."""
 
+from shannonist.models.cond import (
+    AttentionPoolingConditioning,
+    Conditioning,
+    IdentityConditioning,
+    make_conditioning,
+)
 from shannonist.models.critic import (
     BilinearCritic,
     BilinearCriticOutput,
@@ -8,6 +14,7 @@ from shannonist.models.critic import (
     SymmetricPairwiseCritic,
 )
 from shannonist.models.flow import (
+    ConditionedInvertibleLinearLayer,
     FlowDensityEstimator,
     FlowDensityOutput,
     Invertible,
@@ -19,9 +26,12 @@ from shannonist.models.flow import (
 from shannonist.models.mlp import MLP, MultiLinear, MultiMLP
 
 __all__ = [
+    "AttentionPoolingConditioning",
+    "Conditioning",
     "BilinearCritic",
     "BilinearCriticOutput",
     "BilinearPotential",
+    "ConditionedInvertibleLinearLayer",
     "FlowDensityEstimator",
     "FlowDensityOutput",
     "Invertible",
@@ -29,9 +39,11 @@ __all__ = [
     "InvertibleLinear",
     "InvertibleMLP",
     "InvertibleOutput",
+    "IdentityConditioning",
     "MLP",
     "MultiLinear",
     "MultiMLP",
     "PairwiseCritic",
     "SymmetricPairwiseCritic",
+    "make_conditioning",
 ]

@@ -6,12 +6,66 @@ from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
 from shannonist.mi import (
+    ConditionedPairwiseCorrelatedGaussian,
     CorrelatedGausian,
     LatentPairwiseCorrelatedGaussian,
+    MixtureLatentPairwiseCorrelatedGaussian,
     PairwiseCorrelatedGaussian,
     tensordict_collate,
     tensordict_passthrough,
 )
+
+
+def test_mixture_latent_pairwise_correlated_gaussian_context_bags() -> None:
+    matrices = [
+        [[0.0, 0.1], [0.1, 0.0]],
+        [[0.0, 0.3], [0.3, 0.0]],
+    ]
+    dataset = MixtureLatentPairwiseCorrelatedGaussian(
+        count=5,
+        batch_size=3,
+        mutual_information=matrices,
+        dim=4,
+        context_count=6,
+        num_batches=2,
+    )
+
+    batch = dataset[0]
+
+    assert batch.batch_size == torch.Size([3])
+    assert batch["x"].shape == (3, 2, 4)
+    assert batch["context"].shape == (3, 6, 4)
+    assert batch["context_mask"].shape == (3, 6)
+    assert batch["context_mask"].any(dim=-1).all()
+    assert batch["regime"].unique().numel() == 1
+    assert dataset.conditional_mutual_information.shape == (2, 2, 2)
+    assert not torch.equal(
+        dataset.conditional_mutual_information[0],
+        dataset.conditional_mutual_information[1],
+    )
+
+
+def test_conditioned_pairwise_correlated_gaussian_shapes() -> None:
+    matrices = [
+        [[0.0, 0.1], [0.1, 0.0]],
+        [[0.0, 0.3], [0.3, 0.0]],
+    ]
+    dataset = ConditionedPairwiseCorrelatedGaussian(
+        matrices,
+        dim=3,
+        cond_dim=4,
+        context_separation=0.5,
+        context_std=1.0,
+        num_samples=10,
+    )
+
+    sample = dataset[0]
+
+    assert sample["x"].shape == (2, 3)
+    assert sample["cond"].shape == (4,)
+    assert sample["regime"].shape == ()
+    assert sample["regime"].item() in {0, 1}
+    assert dataset.mutual_information.shape == (2, 2, 2)
 
 
 def test_correlated_gaussian_properties_and_dataloader_collation() -> None:

@@ -1,0 +1,74 @@
+seed: 1337
+
+# Two conditional MI regimes. Samples are mixed uniformly at random.
+mutual_information:
+    -
+        - [0.0, 0.30, 0.12]
+        - [0.30, 0.0, 0.22]
+        - [0.12, 0.22, 0.0]
+    -
+        - [0.0, 0.08, 0.25]
+        - [0.08, 0.0, 0.14]
+        - [0.25, 0.14, 0.0]
+count: 3
+dim: 20
+cond_dim: !ref <dim>
+context_separation: 1.0
+context_std: 1.0
+train_samples: 32768
+valid_samples: 8192
+
+number_of_epochs: 20
+batch_size: 256
+lr: 0.0001
+
+enc_dim: !ref <dim>
+conditional_proposal: flow
+entropy_estimator: flow
+proposal_opts:
+    use_conditioning: True
+estimator_opts:
+    use_conditioning: True
+
+train_set: !new:shannonist.mi.ConditionedPairwiseCorrelatedGaussian
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    cond_dim: !ref <cond_dim>
+    context_separation: !ref <context_separation>
+    context_std: !ref <context_std>
+    num_samples: !ref <train_samples>
+
+valid_set: !new:shannonist.mi.ConditionedPairwiseCorrelatedGaussian
+    mutual_information: !ref <mutual_information>
+    dim: !ref <dim>
+    cond_dim: !ref <cond_dim>
+    context_separation: !ref <context_separation>
+    context_std: !ref <context_std>
+    num_samples: !ref <valid_samples>
+
+encoder: !new:torch.nn.Identity
+
+estimator: !new:shannonist.mi.PairwiseBA
+    dim: !ref <dim>
+    enc_dim: !ref <enc_dim>
+    count: !ref <count>
+    encoder: !ref <encoder>
+    conditional_proposal: !ref <conditional_proposal>
+    entropy_estimator: !ref <entropy_estimator>
+    proposal_opts: !ref <proposal_opts>
+    estimator_opts: !ref <estimator_opts>
+
+optimizer: !name:torch.optim.Adam
+    lr: !ref <lr>
+
+train_loader_kwargs:
+    batch_size: !ref <batch_size>
+    shuffle: True
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_collate
+
+valid_loader_kwargs:
+    batch_size: !ref <batch_size>
+    shuffle: False
+    num_workers: 0
+    collate_fn: !name:shannonist.mi.tensordict_collate
