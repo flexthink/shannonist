@@ -4,6 +4,7 @@ from shannonist.models.cond import (
     AttentionPoolingConditioning,
     Conditioning,
     IdentityConditioning,
+    TransformerConditioning,
     make_conditioning,
 )
 from shannonist.models.critic import (
@@ -47,5 +48,6 @@ __all__ = [
     "MultiMLP",
     "PairwiseCritic",
     "SymmetricPairwiseCritic",
+    "TransformerConditioning",
     "make_conditioning",
 ]

@@ -4,6 +4,7 @@ import torch
 from shannonist.models import (
     AttentionPoolingConditioning,
     IdentityConditioning,
+    TransformerConditioning,
     make_conditioning,
 )
 
@@ -91,3 +92,69 @@ def test_conditioning_factory_rejects_unknown_names_and_options() -> None:
         make_conditioning("mystery", dim=3)
     with pytest.raises(ValueError, match="does not accept options"):
         make_conditioning("identity", dim=3, opts={"bias": False})
+
+
+def test_transformer_conditioning_shapes_and_layers() -> None:
+    conditioning = TransformerConditioning(
+        dim=4,
+        num_layers=2,
+        num_heads=2,
+        dropout=0.0,
+    )
+    x = torch.randn(3, 5, 4)
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 1],
+            [0, 1, 1, 0, 0],
+        ]
+    )
+
+    output = conditioning(x, mask)
+
+    assert output.shape == (3, 4)
+    assert len(conditioning.encoder.layers) == 2
+    assert torch.isfinite(output).all()
+
+
+def test_transformer_conditioning_excludes_masked_values() -> None:
+    conditioning = TransformerConditioning(dim=4, dropout=0.0).eval()
+    x = torch.randn(2, 5, 4)
+    mask = torch.tensor([[1, 1, 0, 0, 0], [1, 0, 1, 0, 0]])
+    modified = x.clone()
+    modified[~mask.bool()] = 1_000_000
+
+    expected = conditioning(x, mask.unsqueeze(-1))
+    actual = conditioning(modified, mask)
+
+    assert torch.allclose(actual, expected)
+
+
+def test_transformer_conditioning_handles_empty_rows() -> None:
+    conditioning = TransformerConditioning(dim=4, dropout=0.0)
+    x = torch.randn(2, 3, 4)
+    mask = torch.tensor([[0, 0, 0], [1, 1, 0]])
+
+    output = conditioning(x, mask)
+
+    assert torch.equal(output[0], torch.zeros(4))
+    assert torch.isfinite(output).all()
+
+
+def test_transformer_conditioning_factory_and_validation() -> None:
+    conditioning = make_conditioning(
+        "transformer",
+        dim=4,
+        opts={"num_layers": 2, "num_heads": 2},
+    )
+    assert isinstance(conditioning, TransformerConditioning)
+    assert conditioning.num_layers == 2
+
+    with pytest.raises(ValueError, match="num_layers"):
+        TransformerConditioning(dim=4, num_layers=0)
+    with pytest.raises(ValueError, match="divisible"):
+        TransformerConditioning(dim=3, num_heads=2)
+    with pytest.raises(ValueError, match="x must have shape"):
+        conditioning(torch.randn(3, 4))
+    with pytest.raises(ValueError, match="mask must have shape"):
+        conditioning(torch.randn(2, 3, 4), torch.ones(2, 2))
