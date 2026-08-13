@@ -1,9 +1,13 @@
+import math
+
 import pytest
 import torch
+from torch import nn
 
 from shannonist.models import (
     FlowDensityEstimator,
     Invertible,
+    InvertibleLeakyReLU,
     InvertibleLinear,
     InvertibleMLP,
     InvertibleOutput,
@@ -45,6 +49,30 @@ def test_invertible_subclass_can_round_trip() -> None:
     transformed = transform(x)
     reconstructed = transform.inverse(transformed.value)
     assert torch.allclose(reconstructed.value, x)
+
+
+def test_invertible_leaky_relu_round_trip_and_log_determinant() -> None:
+    transform = InvertibleLeakyReLU(negative_slope=0.2)
+    x = torch.tensor(
+        [[-3.0, -1.0, 0.0, 2.0], [4.0, -2.0, -5.0, 0.0]],
+    )
+
+    output = transform(x)
+    reconstructed = transform.inverse(output.value)
+
+    expected_log_det = torch.full((2,), 2 * torch.log(torch.tensor(0.2)))
+    assert torch.equal(reconstructed.value, x)
+    assert torch.allclose(output.log_abs_det, expected_log_det)
+    assert torch.allclose(
+        output.log_abs_det + reconstructed.log_abs_det,
+        torch.zeros_like(output.log_abs_det),
+    )
+
+
+@pytest.mark.parametrize("negative_slope", [0.0, -0.1, float("inf"), float("nan")])
+def test_invertible_leaky_relu_validates_slope(negative_slope: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        InvertibleLeakyReLU(negative_slope)
 
 
 def test_invertible_linear_matches_linear_semantics() -> None:
@@ -104,9 +132,28 @@ def test_invertible_linear_initialization() -> None:
     assert torch.equal(transform.bias, torch.zeros(4))
 
 
+def test_invertible_linear_initialization_respects_gain() -> None:
+    gain = 1.25
+    transform = InvertibleLinear(dim=4, gain=gain)
+    identity = torch.eye(4)
+
+    assert torch.allclose(
+        transform.weight @ transform.weight.T,
+        gain**2 * identity,
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        transform.log_abs_det,
+        torch.tensor(4 * math.log(gain)),
+        atol=1e-6,
+    )
+
+
 def test_invertible_linear_validates_dimensions() -> None:
     with pytest.raises(ValueError, match="dim"):
         InvertibleLinear(dim=0)
+    with pytest.raises(ValueError, match="gain"):
+        InvertibleLinear(dim=3, gain=0.0)
 
     transform = InvertibleLinear(dim=3)
     with pytest.raises(ValueError, match="trailing dimension"):
@@ -150,15 +197,20 @@ def test_invertible_mlp_round_trip() -> None:
         input_dim=4,
         hidden_dims=(4, 4),
         output_dim=4,
-    )
-    x = torch.randn(2, 3, 4)
+    ).double()
+    x = torch.randn(2, 3, 4, dtype=torch.float64)
 
     output = transform(x)
     reconstructed = transform.inverse(output.value)
 
     assert output.value.shape == x.shape
     assert len(transform.layers) == 3
-    assert torch.allclose(reconstructed.value, x, atol=1e-5)
+    assert len(transform.activations) == 2
+    assert all(
+        isinstance(activation, InvertibleLeakyReLU)
+        for activation in transform.activations
+    )
+    assert torch.allclose(reconstructed.value, x, atol=1e-10)
     assert torch.allclose(
         output.log_abs_det + reconstructed.log_abs_det,
         torch.zeros_like(output.log_abs_det),
@@ -174,10 +226,15 @@ def test_invertible_mlp_applies_inverse_layers_in_reverse() -> None:
     x = torch.randn(5, 3)
     expected = x
     expected_log_abs_det = x.new_zeros(x.shape[:-1])
-    for layer in reversed(transform.layers):
+    for index in reversed(range(len(transform.layers))):
+        layer = transform.layers[index]
         output = layer.inverse(expected)
         expected = output.value
         expected_log_abs_det += output.log_abs_det
+        if index > 0:
+            output = transform.activations[index - 1].inverse(expected)
+            expected = output.value
+            expected_log_abs_det += output.log_abs_det
 
     output = transform.inverse(x)
     assert torch.allclose(output.value, expected)
@@ -208,8 +265,53 @@ def test_invertible_mlp_sums_layer_log_determinants() -> None:
 
     output = transform(x)
 
-    expected = sum(layer.log_abs_det for layer in transform.layers).expand(5)
+    expected = x.new_zeros(5)
+    value = x
+    for index, layer in enumerate(transform.layers):
+        layer_output = layer(value)
+        value = layer_output.value
+        expected = expected + layer_output.log_abs_det
+        if index < len(transform.activations):
+            activation_output = transform.activations[index](value)
+            value = activation_output.value
+            expected = expected + activation_output.log_abs_det
     assert torch.allclose(output.log_abs_det, expected)
+
+
+def test_invertible_mlp_does_not_activate_final_layer() -> None:
+    transform = InvertibleMLP(2, (2,), 2)
+    with torch.no_grad():
+        for layer in transform.layers:
+            layer.P.copy_(torch.eye(2))
+            layer.sign_diag.fill_(1)
+            layer.l_params.zero_()
+            layer.u_params.zero_()
+            layer.log_diag.zero_()
+            assert layer.bias is not None
+            layer.bias.zero_()
+    x = torch.tensor([[-2.0, 3.0]])
+
+    output = transform(x)
+
+    assert len(transform.activations) == 1
+    assert torch.equal(output.value, torch.tensor([[-1.0, 3.0]]))
+    assert torch.allclose(output.log_abs_det, torch.tensor([math.log(0.5)]))
+
+
+def test_invertible_mlp_uses_activation_aware_hidden_gain() -> None:
+    transform = InvertibleMLP(4, (4, 4), 4)
+    expected_gain = nn.init.calculate_gain("leaky_relu", 0.5)
+
+    assert all(
+        activation.negative_slope == 0.5
+        for activation in transform.activations
+        if isinstance(activation, InvertibleLeakyReLU)
+    )
+    assert [layer.gain for layer in transform.layers] == [
+        expected_gain,
+        expected_gain,
+        1.0,
+    ]
 
 
 def test_invertible_mlp_validates_dimensions() -> None:

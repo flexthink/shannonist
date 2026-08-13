@@ -2,6 +2,8 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from copy import deepcopy
+import math
 
 import torch
 from tensordict import TensorClass
@@ -107,6 +109,8 @@ class InvertibleLinear(Invertible):
         Input and output feature dimension.
     bias : bool, default=True
         Whether to include an additive bias.
+    gain : float, default=1.0
+        Scale applied to the initial orthogonal weight matrix.
 
     Attributes
     ----------
@@ -129,11 +133,19 @@ class InvertibleLinear(Invertible):
     P: Tensor
     sign_diag: Tensor
 
-    def __init__(self, dim: int, bias: bool = True) -> None:
+    def __init__(
+        self,
+        dim: int,
+        bias: bool = True,
+        gain: float = 1.0,
+    ) -> None:
         super().__init__()
         if dim <= 0:
             raise ValueError("dim must be positive")
+        if not math.isfinite(gain) or gain <= 0:
+            raise ValueError("gain must be finite and positive")
         self.dim = dim
+        self.gain = gain
         self.l_params = nn.Parameter(torch.empty(dim, dim))
         self.u_params = nn.Parameter(torch.empty(dim, dim))
         self.log_diag = nn.Parameter(torch.empty(dim))
@@ -149,7 +161,7 @@ class InvertibleLinear(Invertible):
         """Initialize from the PLU decomposition of an orthogonal matrix."""
         with torch.no_grad():
             initial_weight = torch.empty_like(self.l_params)
-            nn.init.orthogonal_(initial_weight)
+            nn.init.orthogonal_(initial_weight, gain=self.gain)
             lu, pivots = torch.linalg.lu_factor(initial_weight)
             permutation, lower, upper = torch.lu_unpack(lu, pivots)
             diagonal = upper.diagonal()
@@ -261,13 +273,60 @@ class InvertibleLinear(Invertible):
             raise ValueError(f"input must have trailing dimension {self.dim}")
 
 
+class InvertibleLeakyReLU(Invertible):
+    r"""Apply an invertible leaky-ReLU activation.
+
+    For positive inputs the slope is one; for negative inputs it is
+    ``negative_slope``. Requiring a strictly positive negative slope makes the
+    transformation bijective.
+
+    Parameters
+    ----------
+    negative_slope : float, default=0.5
+        Slope applied to negative inputs. Must be strictly positive.
+    """
+
+    def __init__(self, negative_slope: float = 0.5) -> None:
+        super().__init__()
+        if not math.isfinite(negative_slope) or negative_slope <= 0:
+            raise ValueError("negative_slope must be finite and positive")
+        self.negative_slope = negative_slope
+
+    def forward(self, x: Tensor) -> InvertibleOutput:
+        """Apply the activation and compute its forward log-determinant."""
+        if x.ndim == 0:
+            raise ValueError("input must have a trailing feature dimension")
+        value = F.leaky_relu(x, negative_slope=self.negative_slope)
+        negative_count = (x < 0).sum(dim=-1)
+        log_slope = x.new_tensor(self.negative_slope).log()
+        log_abs_det = negative_count.to(x.dtype) * log_slope
+        return InvertibleOutput(
+            value=value,
+            log_abs_det=log_abs_det,
+            batch_size=x.shape[:-1],
+        )
+
+    def inverse(self, y: Tensor) -> InvertibleOutput:
+        """Apply the analytic inverse and its inverse log-determinant."""
+        if y.ndim == 0:
+            raise ValueError("input must have a trailing feature dimension")
+        value = torch.where(y >= 0, y, y / self.negative_slope)
+        negative_count = (y < 0).sum(dim=-1)
+        log_slope = y.new_tensor(self.negative_slope).log()
+        log_abs_det = -negative_count.to(y.dtype) * log_slope
+        return InvertibleOutput(
+            value=value,
+            log_abs_det=log_abs_det,
+            batch_size=y.shape[:-1],
+        )
+
+
 class InvertibleMLP(Invertible):
-    """Stack invertible affine layers into a reversible module.
+    """Stack invertible affine layers and nonlinear activations.
 
     Because :class:`InvertibleLinear` is square, every requested width must be
-    identical. Without nonlinear transformations, this stack remains an
-    affine map; the class primarily provides composition and reverse-order
-    inversion.
+    identical. An invertible activation follows every linear layer except the
+    last one.
 
     Parameters
     ----------
@@ -277,7 +336,10 @@ class InvertibleMLP(Invertible):
         Feature dimension for each intermediate layer.
     output_dim : int
         Output feature dimension.
-
+    activation : Invertible, optional
+        Activation used after every non-final linear layer. Defaults to
+        :class:`InvertibleLeakyReLU`. Each position receives an independent
+        copy of the supplied module.
     Raises
     ------
     ValueError
@@ -289,6 +351,7 @@ class InvertibleMLP(Invertible):
         input_dim: int,
         hidden_dims: Sequence[int],
         output_dim: int,
+        activation: Invertible | None = None,
     ) -> None:
         super().__init__()
         dimensions = (input_dim, *hidden_dims, output_dim)
@@ -303,8 +366,28 @@ class InvertibleMLP(Invertible):
         self.hidden_dims = tuple(hidden_dims)
         self.output_dim = output_dim
         self.dim = input_dim
+        if activation is None:
+            activation = InvertibleLeakyReLU()
+        if not isinstance(activation, Invertible):
+            raise TypeError("activation must implement Invertible")
+        gain = (
+            nn.init.calculate_gain(
+                "leaky_relu",
+                activation.negative_slope,
+            )
+            if isinstance(activation, InvertibleLeakyReLU)
+            else 1.0
+        )
+        layer_count = len(dimensions) - 1
         self.layers = nn.ModuleList(
-            InvertibleLinear(input_dim) for _ in range(len(dimensions) - 1)
+            InvertibleLinear(
+                input_dim,
+                gain=gain if index < layer_count - 1 else 1.0,
+            )
+            for index in range(layer_count)
+        )
+        self.activations = nn.ModuleList(
+            deepcopy(activation) for _ in range(len(self.layers) - 1)
         )
 
     def forward(self, x: Tensor) -> InvertibleOutput:
@@ -322,10 +405,14 @@ class InvertibleMLP(Invertible):
             log-absolute-determinants.
         """
         log_abs_det = x.new_zeros(x.shape[:-1])
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             output = layer(x)
             x = output.value
             log_abs_det = log_abs_det + output.log_abs_det
+            if index < len(self.activations):
+                output = self.activations[index](x)
+                x = output.value
+                log_abs_det = log_abs_det + output.log_abs_det
         return InvertibleOutput(
             value=x,
             log_abs_det=log_abs_det,
@@ -347,10 +434,15 @@ class InvertibleMLP(Invertible):
             log-absolute-determinants.
         """
         log_abs_det = y.new_zeros(y.shape[:-1])
-        for layer in reversed(self.layers):
+        for index in reversed(range(len(self.layers))):
+            layer = self.layers[index]
             output = layer.inverse(y)
             y = output.value
             log_abs_det = log_abs_det + output.log_abs_det
+            if index > 0:
+                output = self.activations[index - 1].inverse(y)
+                y = output.value
+                log_abs_det = log_abs_det + output.log_abs_det
         return InvertibleOutput(
             value=y,
             log_abs_det=log_abs_det,
@@ -497,6 +589,7 @@ __all__ = [
     "FlowDensityOutput",
     "Invertible",
     "InvertibleLinear",
+    "InvertibleLeakyReLU",
     "InvertibleMLP",
     "InvertibleOutput",
 ]
