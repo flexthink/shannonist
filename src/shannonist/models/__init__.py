@@ -14,6 +14,7 @@ from shannonist.models.critic import (
     SymmetricPairwiseCritic,
 )
 from shannonist.models.flow import (
+    AffineCouplingLinearLayer,
     ConditionedInvertibleLinearLayer,
     FlowDensityEstimator,
     FlowDensityOutput,
@@ -26,6 +27,7 @@ from shannonist.models.flow import (
 from shannonist.models.mlp import MLP, MultiLinear, MultiMLP
 
 __all__ = [
+    "AffineCouplingLinearLayer",
     "AttentionPoolingConditioning",
     "Conditioning",
     "BilinearCritic",

@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from shannonist.models import (
+    AffineCouplingLinearLayer,
     ConditionedInvertibleLinearLayer,
     FlowDensityEstimator,
     Invertible,
@@ -315,6 +316,97 @@ def test_conditioned_invertible_linear_validates_inputs() -> None:
         transform(torch.randn(4, 2), cond=torch.randn(4, 2))
 
 
+def test_affine_coupling_initializes_to_identity() -> None:
+    transform = AffineCouplingLinearLayer(dim=5, cond_dim=3)
+    x = torch.randn(4, 5)
+    cond = torch.randn(4, 3)
+
+    output = transform(x, cond=cond)
+
+    assert torch.equal(output.value, x)
+    assert torch.equal(output.log_abs_det, torch.zeros(4))
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_affine_coupling_round_trip_and_log_det(swap: bool) -> None:
+    transform = AffineCouplingLinearLayer(
+        dim=5,
+        cond_dim=3,
+        swap=swap,
+    ).double()
+    with torch.no_grad():
+        output_layer = transform.conditioner[-1]
+        assert isinstance(output_layer, nn.Linear)
+        output_layer.weight.normal_(std=0.05)
+        output_layer.bias.normal_(std=0.05)
+    x = torch.randn(2, 4, 5, dtype=torch.float64)
+    cond = torch.randn(2, 4, 3, dtype=torch.float64)
+
+    output = transform(x, cond=cond)
+    reconstructed = transform.inverse(output.value, cond=cond)
+
+    assert torch.allclose(reconstructed.value, x, atol=1e-10)
+    assert torch.allclose(
+        output.log_abs_det + reconstructed.log_abs_det,
+        torch.zeros_like(output.log_abs_det),
+        atol=1e-10,
+    )
+    assert torch.equal(
+        output.value[..., transform.passive_indices],
+        x[..., transform.passive_indices],
+    )
+
+
+def test_affine_coupling_log_det_matches_jacobian() -> None:
+    transform = AffineCouplingLinearLayer(dim=4, cond_dim=2).double()
+    with torch.no_grad():
+        output_layer = transform.conditioner[-1]
+        assert isinstance(output_layer, nn.Linear)
+        output_layer.weight.normal_(std=0.05)
+        output_layer.bias.normal_(std=0.05)
+    x = torch.randn(4, dtype=torch.float64)
+    cond = torch.randn(2, dtype=torch.float64)
+
+    output = transform(x, cond=cond)
+    jacobian = torch.autograd.functional.jacobian(
+        lambda value: transform(value, cond=cond).value,
+        x,
+    )
+    _, expected = torch.linalg.slogdet(jacobian)
+
+    assert torch.allclose(output.log_abs_det, expected, atol=1e-10)
+
+
+def test_affine_coupling_uses_unchanged_features_and_condition() -> None:
+    transform = AffineCouplingLinearLayer(dim=4, cond_dim=2)
+    with torch.no_grad():
+        first = transform.conditioner[0]
+        output = transform.conditioner[-1]
+        assert isinstance(first, nn.Linear)
+        assert isinstance(output, nn.Linear)
+        first.weight.fill_(0.25)
+        first.bias.fill_(1.0)
+        output.weight.fill_(0.05)
+    x = torch.ones(3, 4)
+
+    first_output = transform(x, cond=torch.zeros(3, 2))
+    second_output = transform(x, cond=torch.ones(3, 2))
+
+    assert not torch.equal(first_output.value, second_output.value)
+    assert not torch.equal(first_output.log_abs_det, second_output.log_abs_det)
+
+
+def test_affine_coupling_validates_dimensions() -> None:
+    with pytest.raises(ValueError, match="at least two"):
+        AffineCouplingLinearLayer(dim=1, cond_dim=2)
+    with pytest.raises(ValueError, match="cond_dim"):
+        AffineCouplingLinearLayer(dim=2, cond_dim=0)
+
+    transform = AffineCouplingLinearLayer(dim=2, cond_dim=3)
+    with pytest.raises(ValueError, match="cond is required"):
+        transform(torch.randn(4, 2))
+
+
 def test_invertible_mlp_round_trip() -> None:
     transform = InvertibleMLP(
         input_dim=4,
@@ -499,6 +591,36 @@ def test_invertible_mlp_can_use_conditioned_linear_layers() -> None:
     )
 
 
+def test_invertible_mlp_can_use_affine_coupling_layers() -> None:
+    transform = InvertibleMLP(
+        input_dim=4,
+        hidden_dims=(4, 4),
+        output_dim=4,
+        use_conditioning=True,
+        coupling="affine",
+    ).double()
+    x = torch.randn(5, 4, dtype=torch.float64)
+    cond = torch.randn(5, 4, dtype=torch.float64)
+
+    output = transform(x, cond=cond)
+    reconstructed = transform.inverse(output.value, cond=cond)
+
+    assert all(
+        isinstance(layer, AffineCouplingLinearLayer)
+        for layer in transform.layers
+    )
+    assert [layer.swap for layer in transform.layers] == [False, True, False]
+    assert len(transform.activations) == 0
+    assert torch.equal(output.value, x)
+    assert torch.equal(output.log_abs_det, torch.zeros(5, dtype=torch.float64))
+    assert torch.equal(reconstructed.value, x)
+    assert torch.allclose(
+        output.log_abs_det + reconstructed.log_abs_det,
+        torch.zeros_like(output.log_abs_det),
+        atol=1e-10,
+    )
+
+
 def test_conditioned_invertible_mlp_requires_conditioning() -> None:
     transform = InvertibleMLP(3, (3,), 3, use_conditioning=True)
 
@@ -513,6 +635,16 @@ def test_invertible_mlp_validates_dimensions() -> None:
         InvertibleMLP(input_dim=3, hidden_dims=(4,), output_dim=3)
     with pytest.raises(ValueError, match="must match"):
         InvertibleMLP(input_dim=3, hidden_dims=(3,), output_dim=2)
+    with pytest.raises(ValueError, match="coupling must"):
+        InvertibleMLP(
+            3,
+            (3,),
+            3,
+            use_conditioning=True,
+            coupling="unknown",
+        )
+    with pytest.raises(ValueError, match="requires use_conditioning"):
+        InvertibleMLP(3, (3,), 3, coupling="affine")
 
 
 def make_affine_flow_density() -> FlowDensityEstimator:

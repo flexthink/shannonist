@@ -23,7 +23,8 @@ Gaussian MI matrices. The conditioning input is a masked bag of correlated
 Gaussian tokens derived from the sample latent `z`. Regime-dependent means
 are well separated, and `AttentionPoolingConditioning` reduces each bag to the
 vector supplied to both conditional flows. Training and validation print both
-learned matrices independently.
+learned matrices independently. Set `--coupling affine` to replace the
+full-matrix hypernetwork transforms with Real NVP affine coupling layers.
 
 ```bash
 python recipes/LatentPairwiseCorrelatedGaussian/CondMI/train_mixture_ba.py \

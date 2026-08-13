@@ -1067,6 +1067,30 @@ def test_sampled_pairwise_ba_builds_attention_conditioning() -> None:
     assert predictions.entropy.shape == (3, 2, 2)
 
 
+def test_flow_factories_build_affine_coupling() -> None:
+    estimator = SampledPairwiseBA(
+        dim=4,
+        enc_dim=4,
+        sample_size=2,
+        encoder=nn.Identity(),
+        conditional_proposal="flow",
+        entropy_estimator="flow",
+        proposal_opts={"use_conditioning": True, "coupling": "affine"},
+        estimator_opts={"use_conditioning": True, "coupling": "affine"},
+    )
+
+    proposal_transform = estimator.conditional_proposal.density_estimator.transform
+    entropy_transform = estimator.entropy_estimator.density_estimator.transform
+    assert all(
+        layer.__class__.__name__ == "AffineCouplingLinearLayer"
+        for layer in proposal_transform.layers
+    )
+    assert all(
+        layer.__class__.__name__ == "AffineCouplingLinearLayer"
+        for layer in entropy_transform.layers
+    )
+
+
 def test_ba_conditioning_options_require_factory_name() -> None:
     with pytest.raises(ValueError, match="conditioning_opts require"):
         JointBA(dim=2, enc_dim=2, conditioning_opts={"bias": False})

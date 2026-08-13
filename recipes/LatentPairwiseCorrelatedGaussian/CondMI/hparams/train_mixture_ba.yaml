@@ -35,10 +35,13 @@ lr: 0.0001
 
 sample_size: 5
 enc_dim: !ref <dim>
+coupling: hypernetwork
 proposal_opts:
     use_conditioning: True
+    coupling: !ref <coupling>
 estimator_opts:
     use_conditioning: True
+    coupling: !ref <coupling>
 
 train_set: !new:shannonist.mi.MixtureLatentPairwiseCorrelatedGaussian
     count: !ref <latent_count>

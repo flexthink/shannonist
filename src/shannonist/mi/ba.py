@@ -735,6 +735,7 @@ def _make_flow_density_estimator(
     prior = options.pop("prior", None)
     hidden_dims = options.pop("hidden_dims", (dim,))
     use_conditioning = options.pop("use_conditioning", False)
+    coupling = options.pop("coupling", "hypernetwork")
     if options:
         unexpected = ", ".join(sorted(options))
         raise ValueError(f"unknown flow options: {unexpected}")
@@ -744,6 +745,7 @@ def _make_flow_density_estimator(
             hidden_dims=hidden_dims,
             output_dim=dim,
             use_conditioning=use_conditioning,
+            coupling=coupling,
         )
     if not isinstance(transform, Invertible):
         raise TypeError("transform must be an Invertible")

@@ -469,6 +469,159 @@ class ConditionedInvertibleLinearLayer(Invertible):
         )
 
 
+class AffineCouplingLinearLayer(Invertible):
+    r"""Apply a conditional affine coupling transformation.
+
+    Following Real NVP, one feature partition is preserved while the other is
+    scaled and translated:
+
+    .. math::
+
+        y_a &= x_a, \\
+        y_b &= x_b \odot \exp(s([x_a, c])) + t([x_a, c]).
+
+    Concatenating the unchanged partition with external conditioning ``c``
+    lets the transform depend on both while retaining a triangular Jacobian.
+    The final conditioner layer is initialized to zero, so the transformation
+    starts as identity.
+
+    Parameters
+    ----------
+    dim : int
+        Input and output feature dimension. Must be at least two.
+    cond_dim : int
+        Trailing dimension of the external conditioning tensor.
+    hidden_dims : Sequence[int], optional
+        Conditioner-network hidden widths. Defaults to one layer of width
+        ``dim``.
+    swap : bool, default=False
+        Whether the second partition, rather than the first, remains fixed.
+    """
+
+    passive_indices: Tensor
+    active_indices: Tensor
+
+    def __init__(
+        self,
+        dim: int,
+        cond_dim: int,
+        hidden_dims: Sequence[int] | None = None,
+        swap: bool = False,
+    ) -> None:
+        super().__init__()
+        if dim < 2:
+            raise ValueError("dim must be at least two")
+        if cond_dim <= 0:
+            raise ValueError("cond_dim must be positive")
+        if hidden_dims is None:
+            hidden_dims = (dim,)
+        if any(width <= 0 for width in hidden_dims):
+            raise ValueError("all hidden dimensions must be positive")
+
+        self.dim = dim
+        self.cond_dim = cond_dim
+        self.hidden_dims = tuple(hidden_dims)
+        self.swap = swap
+        split = dim // 2
+        first = torch.arange(split)
+        second = torch.arange(split, dim)
+        passive, active = (second, first) if swap else (first, second)
+        self.register_buffer("passive_indices", passive)
+        self.register_buffer("active_indices", active)
+
+        widths = (
+            passive.numel() + cond_dim,
+            *self.hidden_dims,
+            2 * active.numel(),
+        )
+        modules: list[nn.Module] = []
+        for index, (input_width, output_width) in enumerate(
+            zip(widths[:-1], widths[1:], strict=True)
+        ):
+            linear = nn.Linear(input_width, output_width)
+            if index < len(widths) - 2:
+                nn.init.xavier_uniform_(linear.weight)
+                nn.init.zeros_(linear.bias)
+                modules.extend((linear, nn.ReLU()))
+            else:
+                nn.init.zeros_(linear.weight)
+                nn.init.zeros_(linear.bias)
+                modules.append(linear)
+        self.conditioner = nn.Sequential(*modules)
+
+    def forward(
+        self,
+        x: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
+        """Apply the conditional affine coupling transformation."""
+        x, cond = self._validate_and_broadcast(x, cond)
+        passive = x[..., self.passive_indices]
+        active = x[..., self.active_indices]
+        log_scale, translation = self._coupling_parameters(passive, cond)
+        value = x.clone()
+        value[..., self.active_indices] = active * log_scale.exp() + translation
+        return InvertibleOutput(
+            value=value,
+            log_abs_det=log_scale.sum(dim=-1),
+            batch_size=x.shape[:-1],
+        )
+
+    def inverse(
+        self,
+        y: Tensor,
+        cond: Tensor | None = None,
+    ) -> InvertibleOutput:
+        """Invert the conditional affine coupling transformation."""
+        y, cond = self._validate_and_broadcast(y, cond)
+        passive = y[..., self.passive_indices]
+        active = y[..., self.active_indices]
+        log_scale, translation = self._coupling_parameters(passive, cond)
+        value = y.clone()
+        value[..., self.active_indices] = (
+            active - translation
+        ) * (-log_scale).exp()
+        return InvertibleOutput(
+            value=value,
+            log_abs_det=-log_scale.sum(dim=-1),
+            batch_size=y.shape[:-1],
+        )
+
+    def _coupling_parameters(
+        self,
+        passive: Tensor,
+        cond: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Predict log-scales and translations from unchanged features."""
+        parameters = self.conditioner(torch.cat((passive, cond), dim=-1))
+        return parameters.chunk(2, dim=-1)
+
+    def _validate_and_broadcast(
+        self,
+        value: Tensor,
+        cond: Tensor | None,
+    ) -> tuple[Tensor, Tensor]:
+        """Validate and broadcast value and conditioning batch shapes."""
+        if value.ndim == 0 or value.shape[-1] != self.dim:
+            raise ValueError(
+                f"input must have trailing dimension {self.dim}"
+            )
+        if cond is None:
+            raise ValueError("cond is required for an affine coupling layer")
+        if cond.ndim == 0 or cond.shape[-1] != self.cond_dim:
+            raise ValueError(
+                f"cond must have trailing dimension {self.cond_dim}"
+            )
+        batch_shape = torch.broadcast_shapes(
+            value.shape[:-1],
+            cond.shape[:-1],
+        )
+        return (
+            value.expand(*batch_shape, self.dim),
+            cond.expand(*batch_shape, self.cond_dim),
+        )
+
+
 class InvertibleLeakyReLU(Invertible):
     r"""Apply an invertible leaky-ReLU activation.
 
@@ -548,6 +701,9 @@ class InvertibleMLP(Invertible):
         Whether to replace affine layers with
         :class:`ConditionedInvertibleLinearLayer`. Conditioning tensors then
         have trailing dimension ``input_dim``.
+    coupling : {"hypernetwork", "affine"}, default="hypernetwork"
+        Conditional layer parameterization. Ignored when ``use_conditioning``
+        is false.
     Raises
     ------
     ValueError
@@ -561,6 +717,7 @@ class InvertibleMLP(Invertible):
         output_dim: int,
         activation: Invertible | None = None,
         use_conditioning: bool = False,
+        coupling: str = "hypernetwork",
     ) -> None:
         super().__init__()
         dimensions = (input_dim, *hidden_dims, output_dim)
@@ -576,6 +733,7 @@ class InvertibleMLP(Invertible):
         self.output_dim = output_dim
         self.dim = input_dim
         self.use_conditioning = use_conditioning
+        self.coupling = coupling
         if activation is None:
             activation = InvertibleLeakyReLU()
         if not isinstance(activation, Invertible):
@@ -590,14 +748,30 @@ class InvertibleMLP(Invertible):
         )
         layer_count = len(dimensions) - 1
         if use_conditioning:
-            self.layers = nn.ModuleList(
-                ConditionedInvertibleLinearLayer(
-                    input_dim,
-                    cond_dim=input_dim,
+            if coupling == "hypernetwork":
+                self.layers = nn.ModuleList(
+                    ConditionedInvertibleLinearLayer(
+                        input_dim,
+                        cond_dim=input_dim,
+                    )
+                    for _ in range(layer_count)
                 )
-                for _ in range(layer_count)
-            )
+            elif coupling == "affine":
+                self.layers = nn.ModuleList(
+                    AffineCouplingLinearLayer(
+                        input_dim,
+                        cond_dim=input_dim,
+                        swap=bool(index % 2),
+                    )
+                    for index in range(layer_count)
+                )
+            else:
+                raise ValueError(
+                    "coupling must be 'hypernetwork' or 'affine'"
+                )
         else:
+            if coupling != "hypernetwork":
+                raise ValueError("coupling requires use_conditioning=True")
             self.layers = nn.ModuleList(
                 InvertibleLinear(
                     input_dim,
@@ -605,8 +779,13 @@ class InvertibleMLP(Invertible):
                 )
                 for index in range(layer_count)
             )
+        activation_count = (
+            0
+            if use_conditioning and coupling == "affine"
+            else len(self.layers) - 1
+        )
         self.activations = nn.ModuleList(
-            deepcopy(activation) for _ in range(len(self.layers) - 1)
+            deepcopy(activation) for _ in range(activation_count)
         )
 
     def forward(
@@ -670,7 +849,7 @@ class InvertibleMLP(Invertible):
             output = layer.inverse(y, cond=cond)
             y = output.value
             log_abs_det = log_abs_det + output.log_abs_det
-            if index > 0:
+            if index > 0 and index - 1 < len(self.activations):
                 output = self.activations[index - 1].inverse(y, cond=cond)
                 y = output.value
                 log_abs_det = log_abs_det + output.log_abs_det
@@ -834,6 +1013,7 @@ class FlowDensityEstimator(nn.Module):
 
 
 __all__ = [
+    "AffineCouplingLinearLayer",
     "ConditionedInvertibleLinearLayer",
     "FlowDensityEstimator",
     "FlowDensityOutput",
